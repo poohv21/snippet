@@ -381,6 +381,142 @@ def render_oneon1_form():
     
     return False
 
+def get_current_viewing_user():
+    """현재 조회 중인 사용자 정보를 반환합니다.
+    관리자가 다른 사용자를 선택한 경우 viewing_user_info를 반환하고,
+    그렇지 않으면 현재 로그인한 user_info를 반환합니다.
+    """
+    if 'viewing_user_info' in st.session_state:
+        return st.session_state.viewing_user_info
+    return st.session_state.user_info
+
+def prefetch_all_users_cache():
+    """관리자 로그인 시 모든 사용자의 캐시를 백그라운드에서 생성합니다."""
+    try:
+        # 이미 생성된 캐시가 있으면 건너뛰기
+        if 'prefetch_cache_by_user' in st.session_state:
+            cached_users = st.session_state.prefetch_cache_by_user
+            if cached_users and len(cached_users) > 0:
+                return  # 이미 캐시가 있으면 재생성하지 않음
+        
+        # 사용자 목록 가져오기
+        from main import fetch_users_records
+        records = fetch_users_records()
+        target_users = [
+            row for row in records 
+            if str(row.get('표시여부', '')).strip() == '대상'
+        ]
+        
+        if not target_users:
+            return
+        
+        # 사용자별 캐시 딕셔너리 초기화
+        if 'prefetch_cache_by_user' not in st.session_state:
+            st.session_state.prefetch_cache_by_user = {}
+        
+        prefetch_cache_by_user = st.session_state.prefetch_cache_by_user
+        
+        # 각 사용자별로 캐시 생성
+        for user_row in target_users:
+            user_name = str(user_row.get('이름(본명)', '')).strip()
+            if not user_name:
+                continue
+            
+            # 이미 캐시가 있으면 건너뛰기
+            if user_name in prefetch_cache_by_user:
+                continue
+            
+            user_cache = {}
+            
+            # 1. Snippet 아카이브
+            try:
+                import Archive
+                archive_df = None
+                
+                # Google Sheets에서 로드 시도
+                try:
+                    from main import get_google_sheets_client, SPREADSHEET_ID
+                    if st.session_state.get('google_sheets_connected', False):
+                        archive_df = Archive.get_snippets_from_google_sheets(get_google_sheets_client, SPREADSHEET_ID)
+                except:
+                    pass
+                
+                # 실패 시 로컬 CSV에서 로드
+                if archive_df is None or (hasattr(archive_df, 'empty') and archive_df.empty):
+                    archive_df = Archive.get_snippets_from_local_csv()
+                
+                if archive_df is not None and not archive_df.empty:
+                    if '이름' in archive_df.columns:
+                        user_archive = archive_df[archive_df['이름'] == user_name]
+                        user_cache['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
+                    else:
+                        user_cache['archive'] = archive_df.to_dict('records')
+                else:
+                    user_cache['archive'] = []
+            except:
+                user_cache['archive'] = []
+            
+            # 2. CDP
+            try:
+                import cdp
+                cdp_df = cdp._fetch_cdp_dataframe()
+                if cdp_df is not None and not cdp_df.empty:
+                    normalized = {c.strip(): c for c in cdp_df.columns}
+                    name_col = normalized.get("이름") or normalized.get("name") or list(cdp_df.columns)[0]
+                    user_cdp = cdp_df[cdp_df[name_col] == user_name]
+                    user_cache['cdp'] = user_cdp.to_dict('records') if not user_cdp.empty else []
+                else:
+                    user_cache['cdp'] = []
+            except:
+                user_cache['cdp'] = []
+            
+            # 3. IDP
+            try:
+                import idp_usage
+                idp_df = idp_usage.fetch_idp_dataframe()
+                if idp_df is not None and not idp_df.empty:
+                    if '이름' in idp_df.columns:
+                        user_idp = idp_df[idp_df['이름'] == user_name]
+                        user_cache['idp'] = user_idp.to_dict('records') if not user_idp.empty else []
+                    else:
+                        user_cache['idp'] = idp_df.to_dict('records')
+                else:
+                    user_cache['idp'] = []
+            except:
+                user_cache['idp'] = []
+            
+            # 4. Mission & KPI (모든 사용자 공통)
+            try:
+                import organization
+                mission_kpi_df = organization.get_sheet_data(organization.MISSION_KPI_SHEET_ID)
+                if mission_kpi_df is not None and not mission_kpi_df.empty:
+                    user_cache['mission_kpi'] = mission_kpi_df.to_dict('records')
+                else:
+                    user_cache['mission_kpi'] = []
+            except:
+                user_cache['mission_kpi'] = []
+            
+            # 5. Team Ground Rule (모든 사용자 공통)
+            try:
+                import organization
+                ground_rule_df = organization.get_sheet_data(organization.GROUND_RULE_SHEET_ID)
+                if ground_rule_df is not None and not ground_rule_df.empty:
+                    user_cache['ground_rule'] = ground_rule_df.to_dict('records')
+                else:
+                    user_cache['ground_rule'] = []
+            except:
+                user_cache['ground_rule'] = []
+            
+            # 사용자별 캐시 저장
+            prefetch_cache_by_user[user_name] = user_cache
+        
+        # 세션에 저장
+        st.session_state.prefetch_cache_by_user = prefetch_cache_by_user
+        
+    except Exception as e:
+        # 에러 발생해도 계속 진행
+        pass
+
 def render_oneon1_history():
     """1on1 코칭 기록 내역을 렌더링합니다."""
     st.subheader("📚 1on1 코칭 기록 내역")
@@ -393,9 +529,8 @@ def render_oneon1_history():
         return
     
     # 사용자 필터링 (로그인된 사용자만 자신의 기록 보기)
-    user_name = None
-    if st.session_state.get('logged_in') and st.session_state.get('user_info'):
-        user_name = st.session_state.user_info.get('name', '')
+    viewing_user = get_current_viewing_user()
+    user_name = viewing_user.get('name', '') if viewing_user else None
     
     if user_name:
         # 코치 또는 코치이로 필터링
@@ -487,6 +622,240 @@ def render_oneon1_history():
             if row.get('기타 메모'):
                 st.markdown("### 기타 메모")
                 st.write(row.get('기타 메모', ''))
+
+def filter_feedback_text(text):
+    """피드백 텍스트에서 년차, 나이, 근무 년수 관련 표현, 프롬프트 메타 지시사항, 필드명 등을 제거합니다. 포맷은 유지합니다."""
+    if not text:
+        return text
+    
+    import re
+    
+    # 1. 프롬프트 메타 지시사항 제거
+    meta_patterns = [
+        r'⚠️\s*\[.*메타.*지시사항.*\]\s*⚠️',
+        r'\[.*메타.*지시사항.*피드백에.*포함하지.*마세요.*\]',
+        r'\[최우선\s*금지\s*사항\].*위에서\s*경고한\s*대로',
+        r'\[IDP\s*관련\s*금지\s*사항\].*IDP는\s*보조',
+        r'\[IDP\s*관련\s*금지\s*사항\]',
+        r'IDP\s*관련\s*금지\s*사항',
+        r'IDP는\s*보조적인\s*참고\s*자료',
+        r'IDP를\s*상세히\s*분석하거나',
+        r'IDP를\s*구체적으로\s*명시',
+        r'IDP\s*추이\s*분석',
+        r'IDP\s*항목별\s*상세',
+        r'IDP를\s*구체적으로\s*작성',
+        r'데이터에\s*년차.*나이.*연령.*근무\s*년수.*정보가\s*포함되어\s*있어도\s*절대\s*사용하지\s*마세요',
+        r'어떤\s*형태의\s*년차나\s*나이\s*관련\s*표현도\s*완전히\s*금지',
+        r'중요:\s*아래\s*지시사항.*피드백\s*생성\s*방법',
+        r'이\s*지시사항\s*자체를\s*피드백\s*내용에.*포함.*마세요',
+        r'알겠습니다.*피드백\s*생성.*지시사항.*준수',
+        r'⚠️\s*중요한\s*지시사항.*다시\s*한번\s*강조',
+        r'요청하신\s*내용에\s*대한\s*답변.*제공.*알겠습니다',
+        r'요청하신\s*지시사항에\s*따라.*피드백.*제공',
+        r'요청하신\s*지시사항.*준수.*피드백',
+        r'준수하며.*요청하신.*지시사항.*따라.*피드백',
+        r'준수하며.*요청하신.*피드백',
+        r'⚠️\s*중요:\s*근무\s*년수.*근속\s*기간.*절대.*피해야',
+        r'⚠️\s*중요:\s*근무\s*년수.*근속\s*기간.*모든\s*언급.*절대.*피해야',
+        r'중요:\s*근무\s*년수.*근속\s*기간.*절대.*피해야',
+        r'근무\s*년수.*근속\s*기간.*절대.*피해야',
+        r'근무\s*년수.*근속\s*기간.*모든\s*언급.*절대.*피해야',
+        r'⚠️\s*\*{2,}\s*⚠️',
+        r'⚠️.*⚠️',
+        r'에\s*대한\s*모든\s*정보는\s*포함하지\s*마세요',
+        r'이러한\s*규칙은\s*절대적이며',
+        r'어떠한\s*변명이나\s*예외도\s*없습니다',
+        r'근무\s*년수나\s*근속\s*기간을\s*언급하는\s*문장은',
+        r'전체\s*문장을\s*삭제하거나\s*재작성해야',
+        r'이러한\s*표현이\s*발견되면\s*피드백\s*전체가\s*즉시\s*무효화됩니다',
+        r'피드백\s*전체가\s*즉시\s*무효화됩니다',
+        r'무효화됩니다',
+        r'규칙은\s*절대적이며',
+        r'절대적이며.*예외도\s*없습니다',
+        r'참고\s*및\s*인용한\s*Snippet\s*내용은.*큰\s*따옴표.*묶어',
+        r'인용한\s*내용을\s*언급한\s*직후\s*바로\s*뒤에\s*괄호로\s*날짜',
+        r'문장\s*끝에\s*모아서\s*표시하지\s*말고',
+        r'해당\s*내용을\s*언급한\s*즉시\s*날짜\s*표시',
+        r'피드백\s*맨\s*하단에\s*별도의.*참고.*섹션',
+    ]
+    
+    filtered_text = text
+    for pattern in meta_patterns:
+        filtered_text = re.sub(pattern, '', filtered_text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # 2. 년차, 나이, 연령 관련 패턴 제거
+    age_year_patterns = [
+        r'\d+년차',
+        r'\d+세',
+        r'나이\s*\d+세',
+        r'연령\s*\d+세',
+        r'\d+세로\s*(평가|보임|보입니다|판단)',
+        r'\d+년차로\s*(평가|보임|보입니다|판단)',
+        r'\d+세의\s*(사용자|대상자|직원|임직원)',
+        r'\d+년차의\s*(사용자|대상자|직원|임직원)',
+        r'몇\s*년차',
+        r'몇\s*살',
+        r'연령.*\d+',
+        r'\d+.*연령',
+    ]
+    
+    for pattern in age_year_patterns:
+        filtered_text = re.sub(pattern, '', filtered_text, flags=re.IGNORECASE)
+    
+    # 3. 근무 년수 관련 패턴들
+    year_patterns = [
+        r'\d+년차\s*근무\s*기간\s*동안',
+        r'\d+년\s*근무\s*기간\s*동안',
+        r'\d+년차\s*근무\s*(중|기간|동안|만|)',
+        r'\d+년간\s*근무',
+        r'\d+년\s*근무\s*(중|기간|동안|만|)',
+        r'근속\s*\d+년',
+        r'경력\s*연수',
+        r'근속\s*년수',
+        r'\d+년\s*동안',
+        r'\d+년\s*기간\s*동안',
+    ]
+    
+    for pattern in year_patterns:
+        filtered_text = re.sub(pattern, '', filtered_text, flags=re.IGNORECASE)
+    
+    # 4. AI 응답 시작 부분의 메타 지시사항 제거
+    response_intro_patterns = [
+        r'^알겠습니다[^.]*\.\s*',
+        r'^요청하신\s*내용.*?제공하겠습니다[^.]*\.\s*',
+        r'^피드백\s*생성.*?지시사항.*?준수[^.]*\.\s*',
+        r'^준수하며.*?요청하신.*?지시사항.*?따라.*?피드백.*?제공[^.]*\.\s*',
+        r'^준수하며.*?요청하신.*?피드백[^.]*\.\s*',
+        r'준수하며[^.]*요청하신[^.]*지시사항[^.]*따라[^.]*피드백',
+        r'준수하며[^.]*요청하신[^.]*지시사항[^.]*따라',
+        r'를\s*준수하며',
+        r'요청하신\s*지시사항에\s*따라\s*피드백',
+        r'를\s*준수하며[^.]*요청하신[^.]*지시사항',
+        r'를\s*준수하며[^.]*요청하신[^.]*지시사항에\s*따라',
+        r'를\s*준수하며[^.]*요청하신[^.]*지시사항에\s*따라[^.]*피드백',
+        r'를\s*준수하며[^.]*요청하신[^.]*지시사항에\s*따라[^.]*피드백을\s*제공',
+        r'요청하신[^.]*지시사항에\s*따라[^.]*피드백을\s*제공',
+    ]
+    
+    for pattern in response_intro_patterns:
+        filtered_text = re.sub(pattern, '', filtered_text, flags=re.IGNORECASE | re.MULTILINE)
+    
+    # 응답 시작 부분 정리 (여러 줄에 걸친 메타 지시사항)
+    lines = filtered_text.split('\n')
+    cleaned_start_lines = []
+    skip_until_content = False
+    
+    for i, line in enumerate(lines):
+        line_stripped = line.strip()
+        
+        # 첫 몇 줄에서 메타 지시사항 확인
+        if i < 3:  # 처음 3줄만 체크
+            if any(keyword in line_stripped for keyword in [
+                '준수하며', '요청하신 지시사항', '지시사항에 따라', '피드백을 제공', 
+                '⚠️', '를 준수하며', '피드백을', '제공하겠습니다'
+            ]):
+                # 실제 피드백 내용이 포함되어 있는지 확인
+                if not any(valid in line_stripped for valid in [
+                    'CDP', 'IDP', 'Snippet', 'Mission', 'KPI', '업무', '성장', '성과', 
+                    '분석', '강점', '개선', '조직', '목표', '정렬', 'Insight'
+                ]):
+                    skip_until_content = True
+                    continue
+        
+        # 실제 내용이 시작되면 skip 해제
+        if skip_until_content:
+            if any(valid in line_stripped for valid in [
+                'CDP', 'IDP', 'Snippet', 'Mission', 'KPI', '업무', '성장', '성과',
+                '분석', '강점', '개선', '조직', '목표', '정렬', 'Insight', '1.', '2.', '3.'
+            ]) or line_stripped.startswith('#') or line_stripped.startswith('*'):
+                skip_until_content = False
+            else:
+                continue
+        
+        cleaned_start_lines.append(line)
+    
+    filtered_text = '\n'.join(cleaned_start_lines)
+    
+    # 5. 문장 단위로 메타 지시사항 제거 (더 정확한 제거를 위해)
+    sentences = filtered_text.split('\n')
+    cleaned_sentences = []
+    for sentence in sentences:
+        sentence_clean = sentence.strip()
+        if not sentence_clean:
+            cleaned_sentences.append(sentence)
+            continue
+        
+        # 메타 지시사항이 포함된 문장 제거
+        meta_keywords = [
+            '⚠️', '메타 지시사항', '피드백에 포함하지 마세요',
+            '규칙은 절대적이며', '예외도 없습니다',
+            '근무 년수나 근속 기간을 언급하는 문장은',
+            '전체 문장을 삭제하거나 재작성해야',
+            '피드백 전체가 즉시 무효화됩니다',
+            '에 대한 모든 정보는 포함하지 마세요',
+            '준수하며', '요청하신 지시사항', '요청하신 지시사항에 따라',
+            '요청하신 지시사항에 따라 피드백',
+            '지시사항에 따라 피드백을 제공',
+            '지시사항을 준수하며',
+            '를 준수하며', '준수하며.*요청하신',
+            '피드백을 제공', '제공하겠습니다', '따라.*피드백',
+            '데이터에 년차', '나이', '연령', '근무 년수나 정보가 포함되어 있어도 절대 사용하지 마세요',
+            '어떤 형태의 년차나 나이 관련 표현도 완전히 금지',
+            'IDP 관련 금지 사항', 'IDP는 보조적인 참고 자료',
+            'IDP를 상세히 분석하거나', 'IDP를 구체적으로 명시',
+            'IDP 추이 분석', 'IDP 항목별 상세', 'IDP를 구체적으로 작성',
+            '참고 및 인용한 Snippet 내용은 큰 따옴표',
+            '인용한 내용을 언급한 직후 바로 뒤에 괄호로 날짜',
+            '문장 끝에 모아서 표시하지 말고', '해당 내용을 언급한 즉시 날짜 표시',
+            '피드백 맨 하단에 별도의 참고',
+        ]
+        
+        # 메타 키워드가 포함된 문장은 제거
+        has_meta_keyword = any(keyword in sentence_clean for keyword in meta_keywords)
+        if has_meta_keyword:
+            # 실제 피드백 내용이 포함되어 있는지 확인
+            has_valid_content = any(valid in sentence_clean for valid in [
+                'CDP', 'IDP', 'Snippet', 'Mission', 'KPI', '업무', '성장', '성과', 
+                '기록', '내용', '데이터', '분석', '강점', '개선', '조직', '목표', '정렬', 'Insight'
+            ])
+            # 메타 키워드만 있고 실제 내용이 없으면 제거
+            if not has_valid_content:
+                continue
+            # 메타 키워드와 실제 내용이 함께 있으면 메타 부분만 제거 시도
+            # 하지만 안전하게 전체 문장 제거
+            if not has_valid_content or len(sentence_clean) < 50:  # 짧은 문장이고 메타 키워드가 있으면 제거
+                continue
+        
+        # 년차/나이 관련 키워드가 있는 문장인지 확인
+        has_age_year = any(pattern in sentence_clean for pattern in ['년차', '세', '나이', '연령'])
+        if has_age_year:
+            # 년차/나이 관련 키워드가 있지만 실제 내용이 없는 경우만 제거
+            if not any(valid in sentence_clean for valid in ['Snippet', '기록', '내용', '데이터', 'CDP', 'IDP', 'Mission', 'KPI']):
+                continue
+        
+        cleaned_sentences.append(sentence)
+    
+    filtered_text = '\n'.join(cleaned_sentences)
+    
+    # 6. 연속된 공백 정리 (단, 줄바꿈은 유지)
+    lines = filtered_text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        cleaned_line = re.sub(r'[ \t]+', ' ', line)
+        cleaned_line = cleaned_line.rstrip()
+        # 빈 줄이 아닌 경우만 추가
+        if cleaned_line.strip() or line == '':
+            cleaned_lines.append(cleaned_line)
+    
+    filtered_text = '\n'.join(cleaned_lines)
+    
+    # 7. 빈 줄이 3개 이상 연속으로 오는 경우 2개로 제한
+    filtered_text = re.sub(r'\n{3,}', '\n\n', filtered_text)
+    
+    # 8. "참고:" 섹션 전체 제거 (날짜 참고 목록 등)
+    filtered_text = re.sub(r'참고:\s*\n.*?(?=\n\n|\n[#]|\Z)', '', filtered_text, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
+    
+    return filtered_text.strip()
 
 def format_cache_data_for_prompt(cache_data, data_type):
     """캐시 데이터를 프롬프트용 텍스트로 포맷팅합니다."""
@@ -755,7 +1124,30 @@ def get_performance_coaching_feedback():
             return None, "피드백 생성을 위한 데이터가 없습니다. 먼저 데이터를 로드해주세요."
         
         # 프롬프트 구성
-        prompt = f"""다음 정보를 바탕으로 업무 성과 창출과 관련한 상세한 코칭 피드백을 제공해주세요.
+        prompt = f"""⚠️ **[메타 지시사항 - 피드백에 포함하지 마세요]** ⚠️
+
+**중요: 아래 지시사항들은 피드백 생성 방법에 대한 지침입니다. 이 지시사항 자체를 피드백 내용에 포함하거나 언급하지 마세요.**
+
+🚫 **절대 금지: 년차, 나이, 연령, 근무 년수, 근속 기간, 경력 연수에 대한 모든 언급**
+
+데이터에 포함되어 있어도, 계산 가능해도, 명확해도 **절대 사용하지 마세요.**
+
+금지되는 모든 패턴:
+- "N년차", "O세", "나이 N세", "연령 O세"
+- "N년차 근무", "N년차 근무 중", "N년차 근무 기간 동안"
+- "근속 O년", "O년간 근무", "O년 동안", "O년 기간 동안"
+- "경력 연수", "근속 년수", "몇 년차", "몇 살"
+- "N년차로 평가", "N년차로 보임", "O세로 평가"
+- "홍길동님은 N년차", "홍길동님은 O세"
+- **년차나 나이와 관련된 모든 표현**
+
+**이 규칙은 절대적이며, 어떠한 변명이나 예외도 없습니다.**
+**년차나 나이를 언급하는 문장은 전체 문장을 삭제하거나 재작성해야 합니다.**
+이러한 표현이 발견되면 피드백 전체가 즉시 무효화됩니다.
+
+---
+
+다음 정보를 바탕으로 업무 성과 창출과 관련한 상세한 코칭 피드백을 제공해주세요.
 
 **사용자의 Snippet 아카이브:**
 {format_cache_data_for_prompt(archive_data, 'archive')}
@@ -766,12 +1158,30 @@ def get_performance_coaching_feedback():
 **Team Ground Rule:**
 {format_cache_data_for_prompt(ground_rule_data, 'ground_rule')}
 
-위 정보를 종합적으로 분석하여 다음 항목들을 포함한 성과 코칭 피드백을 제공해주세요:
-1. 현재 업무 성과의 강점 분석
-2. 조직 목표와의 연계성 평가
-3. 성과 개선을 위한 구체적인 액션 아이템
-4. 팀 규칙과의 일치도 및 개선점
-5. 향후 성과 창출을 위한 조언
+위 정보를 종합적으로 분석하여 **사용자의 강점과 개선점을 중심으로** 성과 코칭 피드백을 제공해주세요. **특히 강점을 충분히 많이 제시해주세요.**
+
+1. **현재 업무 성과의 강점 분석 (핵심 섹션 - 충분히 많이 제시)**: 
+   - **반드시 Snippet 아카이브의 구체적인 기록을 근거로 하여 여러 가지 강점을 많이 설명해주세요.** 일반적인 표현이나 추상적인 내용이 아닌, 실제 기록된 Snippet 데이터의 구체적인 내용을 인용하여 각 강점을 입증해야 합니다. 예를 들어, "업무에 성실합니다"와 같은 일반적인 표현 대신, "**"영입임원 간담회 기획 보고"** ('25.10.02)를 통해 팀에 기여했습니다"와 같이 구체적인 Snippet 내용을 근거로 제시하세요.
+   - **Snippet 기록을 충분히 활용하여 다양한 측면의 강점을 여러 개 제시해주세요.** (예: 업무 수행 능력, 협업, 문제 해결, 목표 달성 등)
+   - 각 강점마다 **구체적인 Snippet 기록을 인용하여 날짜와 함께 제시해주세요.** (형식: **"Snippet 내용"** ('YY.MM.DD))
+   - 조직 Mission & KPI 및 Team Ground Rule과 연계하여 강점을 평가해주세요.
+   - **강점을 최소 3개 이상, 가능하면 5개 이상 제시해주세요.**
+
+2. **성과 개선점 분석**:
+   - 현재 업무 성과에서 개선이 필요한 부분을 구체적으로 분석해주세요.
+   - 조직 Mission & KPI 달성에 더 기여할 수 있는 방안을 제시해주세요.
+   - Team Ground Rule과의 일치도 및 개선이 필요한 부분을 명시해주세요.
+   - 구체적인 액션 아이템을 제시해주세요.
+
+3. **향후 성과 창출을 위한 조언**:
+   - 강점을 더욱 발전시킬 수 있는 방안
+   - 개선점을 해결하기 위한 구체적인 제안
+   - 조직 목표 달성에 기여할 수 있는 방향 제시
+
+**중요한 지시사항 (필수 준수 - 이 내용을 피드백에 포함하지 마세요):**
+- **[최우선 금지 사항] 위에서 경고한 대로, 데이터에 년차, 나이, 연령, 근무 년수나 경력 연수 정보가 포함되어 있어도 절대 사용하지 마세요. 어떤 형태의 년차나 나이 관련 표현도 완전히 금지입니다.**
+- 참고 및 인용한 Snippet 내용은 **큰 따옴표(" ")로 묶어 볼드체로 진하게 표시**해주세요. **인용한 내용을 언급한 직후 바로 뒤에 괄호로 날짜를 ('YY.MM.DD') 형식으로 개별 표시해주세요.** 문장 끝에 모아서 표시하지 말고, 해당 내용을 언급한 즉시 날짜를 표시하세요. 예: "특히, **"전일만족도 5를 기록한 1on1 결과 보고"** ('25.10.20)에 대한 긍정적인 코멘트는 이러한 능력을 잘 보여줍니다." 또는 "**"영입임원 간담회 기획 보고"** ('25.10.02)를 통해 팀에 기여했습니다." **피드백 맨 하단에 별도의 "참고:" 섹션으로 날짜를 모아서 표시하지 마세요. 각 인용 내용 바로 뒤에만 날짜를 표시합니다.**
+- 조직의 Mission & KPI와 Team Ground Rule의 구체적인 내용을 반드시 인용하여 피드백에 포함해주세요. **특히 Team Ground Rule(CoC 포함)은 총 8개의 항목이 있으므로, 팀 규칙을 언급할 때는 반드시 어떤 특정 항목을 말하는지 구체적으로 지정해주세요.**
 
 피드백은 구체적이고 실행 가능한 내용으로 작성해주세요. 한국어로 답변해주세요."""
 
@@ -874,6 +1284,9 @@ def get_performance_coaching_feedback():
         else:
             feedback_text = str(response)
         
+        # 피드백 텍스트 필터링 (년차, 나이 관련 표현 제거)
+        feedback_text = filter_feedback_text(feedback_text)
+        
         return feedback_text, None
         
     except Exception as e:
@@ -886,7 +1299,9 @@ def get_growth_coaching_feedback():
             return None, "Gemini API 키가 설정되지 않았습니다. .env 파일에 GEMINI_API_KEY를 설정해주세요."
         
         # 캐시 데이터 가져오기
-        prefetch_cache = st.session_state.get('prefetch_cache', {})
+        prefetch_cache = st.session_state.get('prefetch_cache') or {}
+        if not isinstance(prefetch_cache, dict):
+            prefetch_cache = {}
         
         archive_data = prefetch_cache.get('archive', [])
         cdp_data = prefetch_cache.get('cdp', [])
@@ -894,12 +1309,15 @@ def get_growth_coaching_feedback():
         mission_kpi_data = prefetch_cache.get('mission_kpi', [])
         ground_rule_data = prefetch_cache.get('ground_rule', [])
         
-        # 데이터 확인
-        if not archive_data and not cdp_data and not idp_data and not mission_kpi_data and not ground_rule_data:
+        # 데이터 확인 (최소한 archive나 cdp/idp 중 하나는 있어야 함)
+        has_data = bool(archive_data) or bool(cdp_data) or bool(idp_data) or bool(mission_kpi_data) or bool(ground_rule_data)
+        if not has_data:
             return None, "피드백 생성을 위한 데이터가 없습니다. 먼저 데이터를 로드해주세요."
         
         # 프롬프트 구성
         prompt = f"""다음 정보를 바탕으로 성장과 관련한 상세한 코칭 피드백을 제공해주세요.
+
+**중요: 년차, 나이, 연령, 근무 년수, 근속 기간에 대한 언급은 절대 사용하지 마세요. 이 지시사항 자체를 피드백에 포함하지 마세요.**
 
 **사용자의 Snippet 아카이브:**
 {format_cache_data_for_prompt(archive_data, 'archive')}
@@ -916,14 +1334,41 @@ def get_growth_coaching_feedback():
 **Team Ground Rule:**
 {format_cache_data_for_prompt(ground_rule_data, 'ground_rule')}
 
-위 정보를 종합적으로 분석하여 다음 항목들을 포함한 성장 코칭 피드백을 제공해주세요:
-1. 현재 성장 상태와 역량 분석
-2. 개인 개발 계획(IDP) 및 경력 개발 계획(CDP) 달성도 평가
-3. 조직 목표와의 정렬도 및 성장 방향성 제시
-4. 성장을 위한 구체적인 학습 및 개발 액션 아이템
-5. 다음 단계 성장을 위한 조언 및 로드맵
+**성장 코칭 피드백의 주요 방향:**
+성장 코칭 피드백의 핵심은 **개인의 CDP와 조직 Mission & KPI를 중심으로**, 개인이 어떻게 성장하면 좋을지에 대한 인사이트를 제시하는 것입니다. CDP와 조직 Mission & KPI의 정렬 상태를 분석하고, 업무 수행기록(Snippet)이 이를 달성하는 데 어떻게 기여하고 있는지 평가하여, 향후 성장을 위한 구체적인 Insight를 제공하는 것이 주 목적입니다.
 
-피드백은 구체적이고 실행 가능한 내용으로 작성해주세요. 한국어로 답변해주세요."""
+**중요: IDP는 보조적인 참고 자료일 뿐입니다. IDP를 상세히 분석하거나 IDP를 구체적으로 명시하라는 피드백은 제공하지 마세요. IDP에 대한 언급은 최소화하고, CDP와 조직 Mission & KPI를 중심으로 피드백을 구성해주세요.**
+
+위 정보를 종합적으로 분석하여 **사용자가 성장을 위해 잘하고 있는 점과 개선점을 중심으로** 성장 코칭 피드백을 제공해주세요. **특히 잘하고 있는 점을 충분히 많이 제시해주세요.**
+
+1. **성장을 위해 잘하고 있는 점 분석 (핵심 섹션 - 충분히 많이 제시)**: 
+   - **반드시 Snippet 아카이브의 구체적인 기록을 근거로 하여 여러 가지 잘하고 있는 점을 많이 설명해주세요.** 일반적인 표현이나 추상적인 내용이 아닌, 실제 기록된 Snippet 데이터의 구체적인 내용을 인용하여 각 잘하고 있는 점을 입증해야 합니다. 예를 들어, "성장을 위해 노력하고 있습니다"와 같은 일반적인 표현 대신, "**"영입임원 간담회 기획 보고"** ('25.10.02)를 통해 CDP 달성에 기여했습니다"와 같이 구체적인 Snippet 내용을 근거로 제시하세요.
+   - **Snippet 기록을 충분히 활용하여 다양한 측면의 잘하고 있는 점을 여러 개 제시해주세요.** (예: CDP 달성을 위한 업무 수행, 조직 Mission & KPI 기여, 성장 노력 등)
+   - 각 잘하고 있는 점마다 **구체적인 Snippet 기록을 인용하여 날짜와 함께 제시해주세요.** (형식: **"Snippet 내용"** ('YY.MM.DD))
+   - 개인의 CDP와 조직 Mission & KPI의 정렬 상태에서 잘 정렬된 부분을 분석하고, 조직 Mission & KPI와 연계하여 잘하고 있는 점을 평가해주세요.
+   - **잘하고 있는 점을 최소 3개 이상, 가능하면 5개 이상 제시해주세요.**
+   - **참고: IDP는 보조 자료로만 참고하고, IDP를 상세히 분석하거나 IDP를 구체적으로 명시하라는 피드백은 제공하지 마세요.**
+
+2. **성장을 위한 개선점 분석**:
+   - 성장 과정에서 개선이 필요한 부분을 구체적으로 분석해주세요.
+   - 개인의 CDP와 조직 Mission & KPI의 정렬 상태에서 개선이 필요한 부분을 명확히 제시해주세요.
+   - 업무 수행(Snippet)을 통해 CDP와 조직 Mission & KPI 달성에 더욱 기여할 수 있는 방안을 제시해주세요.
+   - 개인이 조직의 목표 달성과 함께 자신의 CDP를 달성하기 위한 성장 경로를 제시해주세요.
+   - 구체적인 액션 아이템을 제시해주세요.
+
+3. **향후 성장을 위한 조언**:
+   - 잘하고 있는 점을 더욱 발전시킬 수 있는 방안
+   - 개선점을 해결하기 위한 구체적인 제안
+   - CDP와 조직 Mission & KPI의 정렬 강화를 위한 구체적인 방안과 Insight 제시
+   - 격려와 응원의 메시지 포함
+
+**중요한 지시사항 (필수 준수 - 이 내용을 피드백에 포함하지 마세요):**
+- **[최우선 금지 사항] 위에서 경고한 대로, 데이터에 년차, 나이, 연령, 근무 년수나 경력 연수 정보가 포함되어 있어도 절대 사용하지 마세요. 어떤 형태의 년차나 나이 관련 표현도 완전히 금지입니다.**
+- **[IDP 관련 금지 사항] IDP는 보조적인 참고 자료일 뿐입니다. IDP를 상세히 분석하거나, IDP를 구체적으로 명시하라는 피드백은 절대 제공하지 마세요. IDP 추이 분석, IDP 항목별 상세 피드백, IDP를 구체적으로 작성하라는 제안 등을 포함하지 마세요. IDP에 대한 언급은 최소화하고, CDP와 조직 Mission & KPI를 중심으로 피드백을 구성해주세요.**
+- 참고 및 인용한 Snippet 내용은 **큰 따옴표(" ")로 묶어 볼드체로 진하게 표시**해주세요. **인용한 내용을 언급한 직후 바로 뒤에 괄호로 날짜를 ('YY.MM.DD') 형식으로 개별 표시해주세요.** 문장 끝에 모아서 표시하지 말고, 해당 내용을 언급한 즉시 날짜를 표시하세요. 예: "특히, **"전일만족도 5를 기록한 1on1 결과 보고"** ('25.10.20)에 대한 긍정적인 코멘트는 이러한 능력을 잘 보여줍니다." 또는 "**"영입임원 간담회 기획 보고"** ('25.10.02)를 통해 팀에 기여했습니다." **피드백 맨 하단에 별도의 "참고:" 섹션으로 날짜를 모아서 표시하지 마세요. 각 인용 내용 바로 뒤에만 날짜를 표시합니다.**
+- 조직의 Mission & KPI와 Team Ground Rule의 구체적인 내용을 반드시 인용하여 피드백에 포함해주세요. **특히 Team Ground Rule(CoC 포함)은 총 8개의 항목이 있으므로, 팀 규칙을 언급할 때는 반드시 어떤 특정 항목을 말하는지 구체적으로 지정해주세요.**
+
+피드백은 구체적이고 실행 가능한 내용으로 작성하고, 격려와 응원의 메시지를 포함해주세요. 한국어로 답변해주세요."""
 
         # Gemini API 호출
         # 사용 가능한 모델 목록 확인
@@ -1024,10 +1469,29 @@ def get_growth_coaching_feedback():
         else:
             feedback_text = str(response)
         
+        # 피드백 텍스트 확인
+        if not feedback_text or not feedback_text.strip():
+            return None, "피드백이 생성되었지만 내용이 비어있습니다."
+        
+        # 피드백 텍스트 필터링 (년차, 나이 관련 표현 제거)
+        filtered_text = filter_feedback_text(feedback_text)
+        
+        # 필터링 후에도 빈 문자열이면 원본 반환
+        if not filtered_text or not filtered_text.strip():
+            # 필터링으로 모든 내용이 삭제된 경우 원본 사용 (하지만 여전히 빈 경우 에러)
+            if feedback_text and feedback_text.strip():
+                feedback_text = feedback_text  # 원본 사용
+            else:
+                return None, "피드백 생성에 실패했습니다. 데이터를 확인해주세요."
+        else:
+            feedback_text = filtered_text
+        
         return feedback_text, None
         
     except Exception as e:
-        return None, f"피드백 생성 중 오류가 발생했습니다: {str(e)}"
+        import traceback
+        error_detail = traceback.format_exc()
+        return None, f"피드백 생성 중 오류가 발생했습니다: {str(e)}\n\n상세 오류:\n{error_detail[:500]}"
 
 def render_performance_feedback():
     """성과 코칭 피드백을 렌더링합니다."""
@@ -1163,6 +1627,23 @@ def render_growth_feedback_auto():
     with st.expander("🌱 성장 코칭 피드백", expanded=True):
         st.markdown("사용자의 성장 상황을 분석하여 코칭 피드백을 제공합니다.")
         
+        # 데이터 상태 확인
+        prefetch_cache = st.session_state.get('prefetch_cache') or {}
+        if not isinstance(prefetch_cache, dict):
+            prefetch_cache = {}
+        
+        archive_data = prefetch_cache.get('archive', [])
+        cdp_data = prefetch_cache.get('cdp', [])
+        idp_data = prefetch_cache.get('idp', [])
+        mission_kpi_data = prefetch_cache.get('mission_kpi', [])
+        ground_rule_data = prefetch_cache.get('ground_rule', [])
+        
+        # 데이터가 있는지 확인
+        has_data = bool(archive_data) or bool(cdp_data) or bool(idp_data) or bool(mission_kpi_data) or bool(ground_rule_data)
+        if not has_data:
+            st.warning("⚠️ 피드백 생성을 위한 데이터가 없습니다. 먼저 데이터를 로드해주세요.")
+            return
+        
         feedback_placeholder = st.empty()
         with feedback_placeholder:
             with st.spinner("🤖 성장 코칭 피드백 생성 중..."):
@@ -1172,6 +1653,14 @@ def render_growth_feedback_auto():
         
         if error:
             st.error(f"❌ {error}")
+            # 디버깅 정보 표시 (옵션)
+            if st.session_state.get('debug_mode', False):
+                with st.expander("🔍 디버깅 정보"):
+                    st.write(f"Archive: {len(archive_data) if archive_data else 0}개")
+                    st.write(f"CDP: {len(cdp_data) if cdp_data else 0}개")
+                    st.write(f"IDP: {len(idp_data) if idp_data else 0}개")
+                    st.write(f"Mission & KPI: {len(mission_kpi_data) if mission_kpi_data else 0}개")
+                    st.write(f"Ground Rule: {len(ground_rule_data) if ground_rule_data else 0}개")
         elif feedback:
             st.markdown("### 📋 코칭 피드백")
             st.markdown(feedback)
@@ -1189,6 +1678,33 @@ def render_growth_feedback_auto():
 
 def ensure_cache_data():
     """필요한 캐시 데이터가 있는지 확인하고, 없으면 로드합니다."""
+    # 현재 조회 중인 사용자 정보 가져오기 (관리자가 다른 사용자를 선택한 경우)
+    viewing_user = get_current_viewing_user()
+    if not viewing_user:
+        # viewing_user가 없으면 user_info 확인
+        user_info = st.session_state.get('user_info')
+        if not user_info:
+            return False
+        viewing_user = user_info
+    
+    current_user_name = viewing_user.get('name')
+    if not current_user_name:
+        return False
+    
+    # 관리자인 경우 사용자별 캐시에서 가져오기
+    user_info = st.session_state.get('user_info')
+    is_admin = user_info and user_info.get('role', '').strip() == 'admin'
+    
+    if is_admin and 'prefetch_cache_by_user' in st.session_state:
+        prefetch_cache_by_user = st.session_state.prefetch_cache_by_user
+        if current_user_name in prefetch_cache_by_user:
+            # 해당 사용자의 캐시를 prefetch_cache로 설정
+            st.session_state.prefetch_cache = prefetch_cache_by_user[current_user_name].copy()
+            prefetch_cache = st.session_state.prefetch_cache
+            # 이미 캐시가 있으므로 바로 반환
+            return True
+    
+    # 일반 사용자이거나 캐시가 없는 경우
     # prefetch_cache 초기화
     if 'prefetch_cache' not in st.session_state:
         st.session_state.prefetch_cache = {}
@@ -1198,13 +1714,19 @@ def ensure_cache_data():
         prefetch_cache = {}
         st.session_state.prefetch_cache = prefetch_cache
     
-    user_info = st.session_state.get('user_info')
-    if not user_info:
-        return False
+    # 캐시에 저장된 사용자 이름 확인 (다른 사용자의 데이터인지 체크)
+    cached_user_name = prefetch_cache.get('_cached_user_name')
     
-    user_name = user_info.get('name')
-    if not user_name:
-        return False
+    # 사용자가 변경되었으면 캐시 완전히 초기화
+    if cached_user_name and cached_user_name != current_user_name:
+        st.session_state.prefetch_cache = {}
+        prefetch_cache = {}
+    
+    # 현재 사용자 이름을 캐시에 저장
+    prefetch_cache['_cached_user_name'] = current_user_name
+    st.session_state.prefetch_cache = prefetch_cache
+    
+    user_name = current_user_name
     
     missing_data = []
     need_load = False
@@ -1489,7 +2011,12 @@ def ensure_cache_data():
 def render_oneon1_embedded():
     """1on1 코칭 페이지를 임베드 모드로 렌더링합니다 (main.py에서 사용)."""
     st.title("👥 1on1 코칭")
-    st.markdown("AI 기반 코칭 피드백을 제공합니다.")
+    
+    # 현재 조회 중인 사용자 정보 가져오기
+    viewing_user = get_current_viewing_user()
+    user_name = viewing_user.get('name', '') if viewing_user else ''
+    
+    st.subheader(f"{user_name}의 1on1 코칭 피드백")
     st.markdown("---")
     
     # 캐시 데이터 확인 및 로딩

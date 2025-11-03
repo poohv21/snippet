@@ -1,5 +1,5 @@
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import hashlib
 import gspread
 from google.oauth2.service_account import Credentials
@@ -242,7 +242,8 @@ def main():
         with col2:
             st.markdown("### 📊 시스템 상태")
             st.success("✅ 로그인 상태: 활성")
-            st.info(f"🕐 현재 시간: {datetime.now().strftime('%Y. %m. %d %p %I:%M:%S')}")
+            kst = timezone(timedelta(hours=9))
+            st.info(f"🕐 현재 시간: {datetime.now(kst).strftime('%Y. %m. %d %p %I:%M:%S')}")
             
             if user['role'] == 'admin':
                 st.warning("👑 관리자 권한으로 로그인되었습니다.")

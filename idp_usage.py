@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import re
@@ -270,8 +270,9 @@ def render_metric_and_cards(df: pd.DataFrame, user_name: str):
     else:
         df_user["_cost"] = 0
 
-    # 올해 누적 금액
-    current_year = datetime.now().year
+    # 올해 누적 금액 (서울 시간 기준)
+    kst = timezone(timedelta(hours=9))
+    current_year = datetime.now(kst).year
     df_this_year = df_user[df_user["_parsed_dt"].apply(lambda x: x.year == current_year if isinstance(x, datetime) else False)]
     total_cost = int(df_this_year["_cost"].sum()) if not df_this_year.empty else 0
 
@@ -432,8 +433,9 @@ def render_idp_registration_form(user_name: str):
             # 저장 시작
             st.session_state.idp_saving = True
             
-            # 타임스탬프 생성
-            now = datetime.now()
+            # 타임스탬프 생성 (서울 시간 기준)
+            kst = timezone(timedelta(hours=9))
+            now = datetime.now(kst)
             timestamp = now.strftime("%Y. %m. %d %p %I:%M:%S").replace("AM", "오전").replace("PM", "오후")
             
             # 결제일 포맷팅
@@ -498,7 +500,8 @@ def render_idp_registration_form(user_name: str):
                                         }
                                         if 'prefetch_cache' in st.session_state:
                                             cache_data['prefetch_data'] = st.session_state.prefetch_cache
-                                            cache_data['prefetch_timestamp'] = datetime.utcnow().isoformat()
+                                            kst = timezone(timedelta(hours=9))
+                                            cache_data['prefetch_timestamp'] = datetime.now(kst).isoformat()
                                         try:
                                             with open(CACHE_FILE, 'w', encoding='utf-8') as f:
                                                 json.dump(cache_data, f, ensure_ascii=False)
@@ -522,12 +525,21 @@ def render_idp_registration_form(user_name: str):
                 st.session_state.idp_saving = False
 
 
+def get_current_viewing_user():
+    """현재 조회 중인 사용자 정보를 반환합니다.
+    관리자가 다른 사용자를 선택한 경우 viewing_user_info를 반환하고,
+    그렇지 않으면 현재 로그인한 user_info를 반환합니다.
+    """
+    if 'viewing_user_info' in st.session_state:
+        return st.session_state.viewing_user_info
+    return st.session_state.user_info
+
 def render_idp_usage_embedded():
     """메인 앱(main.py)에서 임베드 호출용 렌더러 (page_config/로그인 UI 없음)."""
     if not st.session_state.get("logged_in"):
         st.info("로그인 후 이용해주세요.")
         return
-    user = st.session_state.get("user_info", {})
+    user = get_current_viewing_user() or {}
     user_name = user.get("name", "")
     
     # 양식 표시 여부 확인
@@ -541,7 +553,7 @@ def render_idp_usage_embedded():
         return  # 양식이 열려있으면 여기서 종료하여 사용 내역을 표시하지 않음
     
     # 양식이 닫혀있을 때만 사용 내역 표시
-    st.subheader("내 IDP 사용 내역")
+    st.subheader(f"{user_name} 님의 IDP")
     with st.spinner("구글시트에서 데이터를 불러오는 중..."):
         df = fetch_idp_dataframe()
     if df is None:

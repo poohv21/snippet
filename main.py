@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import gspread
 from google.oauth2.service_account import Credentials
 import json
@@ -19,6 +19,24 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    /* 사이드바 폭 설정 */
+    [data-testid="stSidebar"] {
+        min-width: 250px !important;
+        max-width: 250px !important;
+    }
+    
+    [data-testid="stSidebar"] > div:first-child {
+        width: 250px !important;
+    }
+    
+    /* 사이드바 제목 폰트 사이즈 줄이기 (줄바꿈 방지) */
+    [data-testid="stSidebar"] h1 {
+        font-size: 1.5rem !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+    }
+    
     /* Streamlit 메인 뷰 컨테이너를 직접 타겟팅 */
     [data-testid="stAppViewContainer"] > .main, 
     [data-testid="stAppViewContainer"] .main, 
@@ -576,14 +594,21 @@ def _clear_cache():
         st.warning(f"캐시 삭제 실패: {e}")
 
 def _now_iso():
-    return datetime.utcnow().isoformat()
+    """서울 시간(KST, UTC+9) 기준으로 현재 시간을 ISO 형식으로 반환합니다."""
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat()
 
 def _is_idle_expired(last_active_iso: str | None, timeout_minutes: int) -> bool:
+    """서울 시간(KST, UTC+9) 기준으로 유휴 시간이 초과되었는지 확인합니다."""
     if not last_active_iso:
         return False
     try:
+        kst = timezone(timedelta(hours=9))
         last = datetime.fromisoformat(last_active_iso)
-        return datetime.utcnow() - last > timedelta(minutes=timeout_minutes)
+        # last_active_iso가 timezone 정보가 없으면 KST로 간주
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=kst)
+        return datetime.now(kst) - last > timedelta(minutes=timeout_minutes)
     except Exception:
         return False
 
@@ -604,6 +629,15 @@ def try_restore_session_from_cache():
     # Pre-fetching 데이터 복구
     if cached.get('prefetch_data'):
         st.session_state.prefetch_cache = cached.get('prefetch_data')
+
+def get_current_viewing_user():
+    """현재 조회 중인 사용자 정보를 반환합니다.
+    관리자가 다른 사용자를 선택한 경우 viewing_user_info를 반환하고,
+    그렇지 않으면 현재 로그인한 user_info를 반환합니다.
+    """
+    if 'viewing_user_info' in st.session_state:
+        return st.session_state.viewing_user_info
+    return st.session_state.user_info
 
 def touch_session_active():
     """마지막 활동 시간을 갱신하고 캐시에 즉시 반영합니다."""
@@ -630,9 +664,19 @@ def logout_and_clear_cache():
     st.session_state.user_phone = None
     st.session_state.last_active = None
     
-    # Pre-fetching 캐시 삭제
+    # 관리자 사용자 선택 관련 상태 초기화
+    if 'viewing_user_info' in st.session_state:
+        del st.session_state.viewing_user_info
+    if 'selected_user_name' in st.session_state:
+        del st.session_state.selected_user_name
+    if 'admin_target_users' in st.session_state:
+        del st.session_state.admin_target_users
+    
+    # Pre-fetching 캐시 삭제 (일반 캐시와 사용자별 캐시 모두)
     if 'prefetch_cache' in st.session_state:
         del st.session_state.prefetch_cache
+    if 'prefetch_cache_by_user' in st.session_state:
+        del st.session_state.prefetch_cache_by_user
     
     # 페이지 상태 초기화
     st.session_state.current_page = "main"
@@ -692,7 +736,8 @@ def logout_and_clear_cache():
 def refresh_archive_cache():
     """Snippet 아카이브 캐시를 갱신합니다."""
     try:
-        user_name = st.session_state.user_info.get('name') if st.session_state.user_info else None
+        viewing_user = get_current_viewing_user()
+        user_name = viewing_user.get('name') if viewing_user else None
         if not user_name:
             return
         
@@ -746,7 +791,8 @@ def refresh_archive_cache():
 def refresh_cdp_cache():
     """CDP 캐시를 갱신합니다."""
     try:
-        user_name = st.session_state.user_info.get('name') if st.session_state.user_info else None
+        viewing_user = get_current_viewing_user()
+        user_name = viewing_user.get('name') if viewing_user else None
         if not user_name:
             return
         
@@ -778,7 +824,8 @@ def refresh_cdp_cache():
 def refresh_idp_cache():
     """IDP 캐시를 갱신합니다."""
     try:
-        user_name = st.session_state.user_info.get('name') if st.session_state.user_info else None
+        viewing_user = get_current_viewing_user()
+        user_name = viewing_user.get('name') if viewing_user else None
         if not user_name:
             return
         
@@ -811,7 +858,8 @@ def refresh_idp_cache():
 def prefetch_user_data():
     """로그인 성공 시 사용자 데이터를 Pre-fetching하여 캐시에 저장합니다."""
     try:
-        user_name = st.session_state.user_info.get('name') if st.session_state.user_info else None
+        viewing_user = get_current_viewing_user()
+        user_name = viewing_user.get('name') if viewing_user else None
         if not user_name:
             return
         
@@ -1036,6 +1084,20 @@ def render_login():
                             except Exception:
                                 pass
                             
+                            # 로그인 시 viewing_user_info를 현재 사용자로 초기화
+                            st.session_state.viewing_user_info = user_info.copy()
+                            st.session_state.selected_user_name = user_info.get('name', '')
+                            
+                            # 관리자인 경우 모든 사용자 캐시 백그라운드 생성
+                            if user_info.get('role', '').strip() == 'admin':
+                                try:
+                                    import importlib
+                                    oneon1_module = importlib.import_module('1on1')
+                                    if hasattr(oneon1_module, 'prefetch_all_users_cache'):
+                                        oneon1_module.prefetch_all_users_cache()
+                                except Exception:
+                                    pass  # 에러 발생해도 계속 진행
+                            
                             # 로그인 성공 시 즉시 Daily Snippet 기록 페이지로 이동 (사이드바 버튼 효과)
                             st.session_state.logging_in = False
                             # Daily Snippet 페이지로 이동 (사이드바 버튼을 누른 것과 동일한 효과)
@@ -1079,6 +1141,91 @@ def render_sidebar():
         if st.session_state.logged_in and st.session_state.user_info:
             user = st.session_state.user_info
             st.success(f"안녕하세요, {user['name']}님!")
+            
+            # 관리자인 경우 사용자 선택 드롭박스 추가
+            if user.get('role', '').strip() == 'admin':
+                # 표시여부가 '대상'인 사용자 목록 가져오기 (캐시 사용)
+                if 'admin_target_users' not in st.session_state:
+                    records = fetch_users_records()
+                    target_users = [
+                        row for row in records 
+                        if str(row.get('표시여부', '')).strip() == '대상'
+                    ]
+                    st.session_state.admin_target_users = target_users
+                else:
+                    target_users = st.session_state.admin_target_users
+                
+                if target_users:
+                    # 사용자 이름 리스트 생성 (현재 로그인한 사용자를 기본값으로)
+                    user_names = [str(row.get('이름(본명)', '')).strip() for row in target_users]
+                    
+                    # 세션 상태에 선택된 사용자 정보 저장
+                    if 'selected_user_name' not in st.session_state:
+                        st.session_state.selected_user_name = user['name']
+                    
+                    # 현재 선택된 사용자의 인덱스 찾기
+                    try:
+                        current_index = user_names.index(st.session_state.selected_user_name)
+                    except ValueError:
+                        current_index = user_names.index(user['name']) if user['name'] in user_names else 0
+                        st.session_state.selected_user_name = user_names[current_index]
+                    
+                    # 드롭박스와 새로고침 버튼을 나란히 배치
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        selected_name = st.selectbox(
+                            "📋 사용자 선택",
+                            options=user_names,
+                            index=current_index,
+                            key="admin_user_select"
+                        )
+                    with col2:
+                        st.markdown("<div style='margin-top: 1.8rem;'></div>", unsafe_allow_html=True)
+                        if st.button("🔄", key="refresh_user_list", help="사용자 목록 새로고침"):
+                            if 'admin_target_users' in st.session_state:
+                                del st.session_state.admin_target_users
+                            st.rerun()
+                    
+                    # 선택된 사용자가 변경되면 세션 업데이트
+                    if selected_name != st.session_state.selected_user_name:
+                        st.session_state.selected_user_name = selected_name
+                        # 선택된 사용자의 전체 정보 가져오기
+                        for row in target_users:
+                            if str(row.get('이름(본명)', '')).strip() == selected_name:
+                                # 현재 보고 있는 사용자 정보를 세션에 저장 (원본 로그인 정보는 유지)
+                                st.session_state.viewing_user_info = {
+                                    'phone': str(row.get('휴대폰번호', '')).strip(),
+                                    'password': str(row.get('비밀번호', '')).strip(),
+                                    'name': str(row.get('이름(본명)', '')).strip(),
+                                    'email': str(row.get('회사메일', '')).strip(),
+                                    'role': str(row.get('권한', 'user')).strip() or 'user',
+                                    'timestamp': str(row.get('타임스탬프', '')).strip(),
+                                    'display': str(row.get('표시여부', '')).strip(),
+                                }
+                                # 사용자 전환 시 해당 사용자의 캐시를 사용
+                                if 'prefetch_cache_by_user' in st.session_state:
+                                    prefetch_cache_by_user = st.session_state.prefetch_cache_by_user
+                                    if selected_name in prefetch_cache_by_user:
+                                        # 해당 사용자의 캐시를 prefetch_cache로 설정
+                                        st.session_state.prefetch_cache = prefetch_cache_by_user[selected_name].copy()
+                                    else:
+                                        # 캐시가 없으면 초기화
+                                        if 'prefetch_cache' in st.session_state:
+                                            del st.session_state.prefetch_cache
+                                else:
+                                    # 사용자별 캐시가 없으면 일반 캐시 초기화
+                                    if 'prefetch_cache' in st.session_state:
+                                        del st.session_state.prefetch_cache
+                                st.rerun()
+                                break
+                    
+                    # viewing_user_info가 없으면 현재 로그인한 사용자 정보로 초기화
+                    if 'viewing_user_info' not in st.session_state:
+                        st.session_state.viewing_user_info = user.copy()
+                    
+                    # 선택된 사용자가 현재 로그인 사용자와 다를 경우 표시
+                    if selected_name != user['name']:
+                        st.info(f"👁️ 현재 조회 중: {selected_name}")
             
             # 개인 정보 수정 버튼
             if st.button("✏️ 개인 정보 수정", use_container_width=True):
@@ -1162,6 +1309,17 @@ def render_daily_snippet():
     st.title("📝 Daily Snippet 기록")
     st.markdown("매일의 상태와 업무를 기록하고 팀과 공유해보세요!")
     st.markdown("---")
+    
+    # Daily Snippet 기록은 항상 로그인한 본인만 가능
+    # (관리자가 다른 사용자를 선택해도 기록은 본인 것만)
+    logged_in_user = st.session_state.user_info
+    user_name = logged_in_user.get('name', '') if logged_in_user else ''
+    st.subheader(f"{user_name} 님의 Daily Snippet")
+    
+    # 관리자가 다른 사용자를 선택한 경우 안내 메시지 표시
+    viewing_user = get_current_viewing_user()
+    if viewing_user and logged_in_user and viewing_user.get('name') != logged_in_user.get('name'):
+        st.info(f"💡 Daily Snippet 기록은 로그인한 본인({user_name})만 작성할 수 있습니다. 다른 사용자의 Snippet은 '📚 Snippet 아카이브' 페이지에서 조회하실 수 있습니다.")
     
     # daily_snippet.py의 임베드 함수 사용
     try:

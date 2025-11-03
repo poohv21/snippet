@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 import json
@@ -655,8 +655,9 @@ def render_step_3():
 def save_data():
     """데이터를 저장합니다."""
     try:
-        # 현재 시간 생성
-        now = datetime.now()
+        # 현재 시간 생성 (서울 시간 기준)
+        kst = timezone(timedelta(hours=9))
+        now = datetime.now(kst)
         timestamp = now.strftime("%Y. %m. %d %p %I:%M:%S").replace("AM", "오전").replace("PM", "오후")
         
         # 데이터 준비
@@ -776,8 +777,9 @@ def render_login():
 def save_data_embedded(save_data_callback=None):
     """임베드 모드에서 데이터를 저장합니다. 외부 저장 함수를 사용합니다."""
     try:
-        # 현재 시간 생성
-        now = datetime.now()
+        # 현재 시간 생성 (서울 시간 기준)
+        kst = timezone(timedelta(hours=9))
+        now = datetime.now(kst)
         timestamp = now.strftime("%Y. %m. %d %p %I:%M:%S").replace("AM", "오전").replace("PM", "오후")
         
         # 데이터 준비

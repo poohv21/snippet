@@ -118,14 +118,28 @@ def _fetch_cdp_dataframe() -> pd.DataFrame | None:
         return None
 
 
+def get_current_viewing_user():
+    """현재 조회 중인 사용자 정보를 반환합니다.
+    관리자가 다른 사용자를 선택한 경우 viewing_user_info를 반환하고,
+    그렇지 않으면 현재 로그인한 user_info를 반환합니다.
+    """
+    if 'viewing_user_info' in st.session_state:
+        return st.session_state.viewing_user_info
+    return st.session_state.user_info
+
 def render_cdp_embedded():
     """메인 앱 내에서 임베디드 형태로 CDP 화면을 렌더링합니다."""
     # 로그인 확인
-    if not st.session_state.get("logged_in") or not st.session_state.get("user_info"):
+    if not st.session_state.get("logged_in"):
         st.warning("로그인이 필요합니다.")
         return
 
-    user_name = st.session_state.user_info.get("name")
+    viewing_user = get_current_viewing_user()
+    if not viewing_user:
+        st.warning("사용자 정보를 찾을 수 없습니다.")
+        return
+    
+    user_name = viewing_user.get("name")
 
     with st.spinner("CDP 데이터를 불러오는 중..."):
         df = _fetch_cdp_dataframe()
@@ -264,7 +278,8 @@ def render_cdp_embedded():
                             
                             # 저장 성공 시 CDP 캐시 갱신
                             try:
-                                user_name = st.session_state.user_info.get('name') if st.session_state.get('user_info') else None
+                                viewing_user = get_current_viewing_user()
+                                user_name = viewing_user.get('name') if viewing_user else None
                                 if user_name:
                                     # prefetch_cache 초기화
                                     if 'prefetch_cache' not in st.session_state:
@@ -287,7 +302,7 @@ def render_cdp_embedded():
                                             # main.py의 구조를 참고하여 캐시 갱신
                                             import json
                                             import os
-                                            from datetime import datetime
+                                            from datetime import datetime, timezone, timedelta
                                             
                                             CACHE_FILE = "user_cache.json"
                                             if st.session_state.get('logged_in'):
@@ -300,7 +315,8 @@ def render_cdp_embedded():
                                                 }
                                                 if 'prefetch_cache' in st.session_state:
                                                     cache_data['prefetch_data'] = st.session_state.prefetch_cache
-                                                    cache_data['prefetch_timestamp'] = datetime.utcnow().isoformat()
+                                                    kst = timezone(timedelta(hours=9))
+                                                    cache_data['prefetch_timestamp'] = datetime.now(kst).isoformat()
                                                 try:
                                                     with open(CACHE_FILE, 'w', encoding='utf-8') as f:
                                                         json.dump(cache_data, f, ensure_ascii=False)
