@@ -750,6 +750,32 @@ def _ensure_archive_styles():
     )
 
 
+def _is_retryable_error(error_msg: str) -> bool:
+    """재시도 가능한 오류인지 확인합니다."""
+    msg_lower = error_msg.lower()
+    return ('429' in msg_lower) or ('quota' in msg_lower) or ('rate' in msg_lower and 'limit' in msg_lower)
+
+def _sheets_call_with_retry(callable_fn, *args, **kwargs):
+    """Google Sheets API 호출을 지수 백오프로 재시도합니다."""
+    import time
+    import random
+    delays = [0, 1, 2, 4, 8, 16]
+    last_error = None
+    for delay in delays:
+        if delay > 0:
+            time.sleep(delay + random.uniform(0, 0.5))
+        try:
+            return callable_fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+            if _is_retryable_error(error_msg):
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google Sheets API 호출이 실패했습니다.")
+
 def get_snippets_from_google_sheets(get_google_sheets_client, spreadsheet_id):
     """Google Sheets에서 Snippet 데이터를 가져옵니다."""
     try:
@@ -757,14 +783,19 @@ def get_snippets_from_google_sheets(get_google_sheets_client, spreadsheet_id):
         if not client:
             return None
         
-        spreadsheet = client.open_by_key(spreadsheet_id)
-        worksheet = spreadsheet.worksheet("Sheet1")
+        def _fetch_records():
+            spreadsheet = client.open_by_key(spreadsheet_id)
+            worksheet = spreadsheet.worksheet("Sheet1")
+            records = worksheet.get_all_records()
+            return pd.DataFrame(records) if records else pd.DataFrame()
         
-        # 모든 데이터 가져오기
-        records = worksheet.get_all_records()
-        return pd.DataFrame(records)
+        return _sheets_call_with_retry(_fetch_records)
     except Exception as e:
-        st.error(f"Google Sheets 데이터 가져오기 오류: {e}")
+        error_msg = str(e).lower()
+        if _is_retryable_error(error_msg):
+            st.warning("Snippet 아카이브 로드 중 호출 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
+        else:
+            st.error(f"Google Sheets 데이터 가져오기 오류: {e}")
         return None
 
 

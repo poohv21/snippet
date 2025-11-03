@@ -100,21 +100,54 @@ def _get_google_sheets_client():
         return None
 
 
+def _is_retryable_error(error_msg: str) -> bool:
+    """재시도 가능한 오류인지 확인합니다."""
+    msg_lower = error_msg.lower()
+    return ('429' in msg_lower) or ('quota' in msg_lower) or ('rate' in msg_lower and 'limit' in msg_lower)
+
+def _sheets_call_with_retry(callable_fn, *args, **kwargs):
+    """Google Sheets API 호출을 지수 백오프로 재시도합니다."""
+    import time
+    import random
+    delays = [0, 1, 2, 4, 8, 16]
+    last_error = None
+    for delay in delays:
+        if delay > 0:
+            time.sleep(delay + random.uniform(0, 0.5))
+        try:
+            return callable_fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+            if _is_retryable_error(error_msg):
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google Sheets API 호출이 실패했습니다.")
+
 def _fetch_cdp_dataframe() -> pd.DataFrame | None:
     """CDP 구글시트에서 전체 데이터를 DataFrame으로 반환합니다."""
     try:
         client = _get_google_sheets_client()
         if not client:
             return None
-        spreadsheet = client.open_by_key(CDP_SPREADSHEET_ID)
-        # 첫 번째 시트 사용 (Sheet1)
-        worksheet = spreadsheet.sheet1
-        records = worksheet.get_all_records()
-        if not records:
-            return pd.DataFrame()
-        return pd.DataFrame(records)
+        
+        def _fetch_records():
+            spreadsheet = client.open_by_key(CDP_SPREADSHEET_ID)
+            worksheet = spreadsheet.sheet1
+            records = worksheet.get_all_records()
+            if not records:
+                return pd.DataFrame()
+            return pd.DataFrame(records)
+        
+        return _sheets_call_with_retry(_fetch_records)
     except Exception as e:
-        st.error(f"CDP 데이터 가져오기 오류: {e}")
+        error_msg = str(e).lower()
+        if _is_retryable_error(error_msg):
+            st.warning("CDP 데이터 로드 중 호출 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
+        else:
+            st.error(f"CDP 데이터 가져오기 오류: {e}")
         return None
 
 
@@ -227,47 +260,45 @@ def render_cdp_embedded():
                         if "cdp_pending_data" in st.session_state:
                             del st.session_state["cdp_pending_data"]
                     else:
-                        spreadsheet = client.open_by_key(CDP_SPREADSHEET_ID)
-                        worksheet = spreadsheet.sheet1
-                        
-                        # 헤더 행 가져오기
-                        headers = worksheet.row_values(1)
-                        name_idx = None
-                        long_idx = None
-                        this_idx = None
-                        next_idx = None
-                        
-                        # 컬럼명 정규화 (공백 제거)
-                        name_col_stripped = name_col.strip() if name_col else ""
-                        long_col_stripped = long_col.strip() if long_col else ""
-                        this_col_stripped = this_col.strip() if this_col else ""
-                        next_col_stripped = next_col.strip() if next_col else ""
-                        
-                        for i, header in enumerate(headers, start=1):
-                            header_stripped = header.strip() if header else ""
-                            if header_stripped == name_col_stripped or header_stripped == name_col:
-                                name_idx = i
-                            elif header_stripped == long_col_stripped or header_stripped == long_col:
-                                long_idx = i
-                            elif header_stripped == this_col_stripped or header_stripped == this_col:
-                                this_idx = i
-                            elif header_stripped == next_col_stripped or header_stripped == next_col:
-                                next_idx = i
-                        
-                        # 사용자 행 찾기
-                        all_values = worksheet.get_all_values()
-                        user_row_idx = None
-                        for idx, row_values in enumerate(all_values[1:], start=2):  # 헤더 제외하고 2부터 시작
-                            if len(row_values) > name_idx - 1 and row_values[name_idx - 1] == user_name:
-                                user_row_idx = idx
-                                break
-                        
-                        if user_row_idx is None:
-                            st.error("사용자 행을 찾을 수 없습니다.")
-                            st.session_state.cdp_saving = False
-                            if "cdp_pending_data" in st.session_state:
-                                del st.session_state["cdp_pending_data"]
-                        else:
+                        def _update_cdp():
+                            spreadsheet = client.open_by_key(CDP_SPREADSHEET_ID)
+                            worksheet = spreadsheet.sheet1
+                            
+                            # 헤더 행 가져오기
+                            headers = worksheet.row_values(1)
+                            name_idx = None
+                            long_idx = None
+                            this_idx = None
+                            next_idx = None
+                            
+                            # 컬럼명 정규화 (공백 제거)
+                            name_col_stripped = name_col.strip() if name_col else ""
+                            long_col_stripped = long_col.strip() if long_col else ""
+                            this_col_stripped = this_col.strip() if this_col else ""
+                            next_col_stripped = next_col.strip() if next_col else ""
+                            
+                            for i, header in enumerate(headers, start=1):
+                                header_stripped = header.strip() if header else ""
+                                if header_stripped == name_col_stripped or header_stripped == name_col:
+                                    name_idx = i
+                                elif header_stripped == long_col_stripped or header_stripped == long_col:
+                                    long_idx = i
+                                elif header_stripped == this_col_stripped or header_stripped == this_col:
+                                    this_idx = i
+                                elif header_stripped == next_col_stripped or header_stripped == next_col:
+                                    next_idx = i
+                            
+                            # 사용자 행 찾기
+                            all_values = worksheet.get_all_values()
+                            user_row_idx = None
+                            for idx, row_values in enumerate(all_values[1:], start=2):  # 헤더 제외하고 2부터 시작
+                                if len(row_values) > name_idx - 1 and row_values[name_idx - 1] == user_name:
+                                    user_row_idx = idx
+                                    break
+                            
+                            if user_row_idx is None:
+                                raise ValueError("사용자 행을 찾을 수 없습니다.")
+                            
                             # 값 업데이트
                             if long_idx:
                                 worksheet.update_cell(user_row_idx, long_idx, edited_long_plan)
@@ -275,12 +306,17 @@ def render_cdp_embedded():
                                 worksheet.update_cell(user_row_idx, this_idx, edited_this_plan)
                             if next_idx:
                                 worksheet.update_cell(user_row_idx, next_idx, edited_next_plan)
+                            return True
+                        
+                        try:
+                            _sheets_call_with_retry(_update_cdp)
                             
                             # 저장 성공 시 CDP 캐시 갱신
-                            try:
-                                viewing_user = get_current_viewing_user()
-                                user_name = viewing_user.get('name') if viewing_user else None
-                                if user_name:
+                            viewing_user = get_current_viewing_user()
+                            user_name_for_cache = viewing_user.get('name') if viewing_user else None
+                            if user_name_for_cache:
+                                try:
+                                    user_name = user_name_for_cache
                                     # prefetch_cache 초기화
                                     if 'prefetch_cache' not in st.session_state:
                                         st.session_state.prefetch_cache = {}
@@ -324,9 +360,9 @@ def render_cdp_embedded():
                                                     pass
                                     except Exception:
                                         pass
-                            except Exception:
-                                # 캐시 갱신 실패해도 저장은 계속 진행
-                                pass
+                                except Exception:
+                                    # 캐시 갱신 실패해도 저장은 계속 진행
+                                    pass
                             
                             st.success("CDP 정보가 성공적으로 업데이트되었습니다!")
                             st.session_state.cdp_saving = False
@@ -334,8 +370,23 @@ def render_cdp_embedded():
                             if "cdp_pending_data" in st.session_state:
                                 del st.session_state["cdp_pending_data"]
                             st.rerun()
+                        except Exception as update_error:
+                            error_msg = str(update_error).lower()
+                            if _is_retryable_error(error_msg):
+                                st.warning("CDP 업데이트 중 호출 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
+                            elif isinstance(update_error, ValueError):
+                                st.error(str(update_error))
+                            else:
+                                st.error(f"CDP 업데이트 중 오류가 발생했습니다: {update_error}")
+                            st.session_state.cdp_saving = False
+                            if "cdp_pending_data" in st.session_state:
+                                del st.session_state["cdp_pending_data"]
             except Exception as e:
-                st.error(f"업데이트 중 오류가 발생했습니다: {e}")
+                error_msg = str(e).lower()
+                if _is_retryable_error(error_msg):
+                    st.warning("CDP 업데이트 중 호출 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
+                else:
+                    st.error(f"업데이트 중 오류가 발생했습니다: {e}")
                 st.session_state.cdp_saving = False
                 if "cdp_pending_data" in st.session_state:
                     del st.session_state["cdp_pending_data"]

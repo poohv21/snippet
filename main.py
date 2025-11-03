@@ -3,6 +3,8 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 import gspread
 from google.oauth2.service_account import Credentials
+import time
+import random
 import json
 import os
 import streamlit.components.v1 as components
@@ -84,6 +86,30 @@ USERS_SPREADSHEET_ID = (
 # 캐시 파일 설정
 CACHE_FILE = "user_cache.json"
 
+def _is_retryable_error(error_msg: str) -> bool:
+    """재시도 가능한 오류인지 확인합니다."""
+    msg_lower = error_msg.lower()
+    return ('429' in msg_lower) or ('quota' in msg_lower) or ('rate' in msg_lower and 'limit' in msg_lower)
+
+def _sheets_call_with_retry(callable_fn, *args, **kwargs):
+    """Google Sheets API 호출을 지수 백오프로 재시도합니다."""
+    delays = [0, 1, 2, 4, 8, 16]
+    last_error = None
+    for delay in delays:
+        if delay > 0:
+            time.sleep(delay + random.uniform(0, 0.5))
+        try:
+            return callable_fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+            if _is_retryable_error(error_msg):
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google Sheets API 호출이 실패했습니다.")
+
 def get_google_sheets_client():
     """Google Sheets 클라이언트를 반환합니다."""
     try:
@@ -153,14 +179,20 @@ def save_to_google_sheets(data):
         if not client:
             return False
         
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        worksheet = spreadsheet.sheet1
+        # 재시도 로직 적용
+        def _append_row():
+            spreadsheet = client.open_by_key(SPREADSHEET_ID)
+            worksheet = spreadsheet.sheet1
+            worksheet.append_row(data)
+            return True
         
-        # 데이터를 행으로 추가
-        worksheet.append_row(data)
-        return True
+        return _sheets_call_with_retry(_append_row)
     except Exception as e:
-        st.error(f"Google Sheets 저장 오류: {e}")
+        error_msg = str(e).lower()
+        if _is_retryable_error(error_msg):
+            st.warning("Google Sheets 저장 중 호출 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
+        else:
+            st.error(f"Google Sheets 저장 오류: {e}")
         return False
 
 def save_data_with_fallback(data):
@@ -181,17 +213,30 @@ def save_data_with_fallback(data):
     return result
 
 def fetch_users_records():
-    """사용자 정보 시트의 모든 레코드를 반환합니다."""
+    """사용자 정보 시트의 모든 레코드를 반환합니다. (캐시 사용)"""
     try:
-        client = get_google_sheets_client()
-        if not client:
-            return []
-        spreadsheet = client.open_by_key(USERS_SPREADSHEET_ID)
-        worksheet = spreadsheet.sheet1
-        records = worksheet.get_all_records()
-        return records
+        return _users_records_cached(USERS_SPREADSHEET_ID)
     except Exception as e:
         st.error(f"사용자 데이터 로드 오류: {e}")
+        return []
+
+# 앱 레벨 캐시: 사용자 시트 전체 레코드 (다중 세션 공유)
+@st.cache_data(ttl=300, show_spinner=False)
+def _users_records_cached(spreadsheet_id: str):
+    client = get_google_sheets_client()
+    if not client:
+        return []
+    
+    def _fetch_records():
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        worksheet = spreadsheet.sheet1
+        records = worksheet.get_all_records()
+        return records or []
+    
+    try:
+        return _sheets_call_with_retry(_fetch_records)
+    except Exception as e:
+        # 재시도 실패 시 빈 리스트 반환 (에러 메시지는 상위에서 처리)
         return []
 
 def _digits_only(value: str | int | None) -> str:
@@ -255,39 +300,47 @@ def update_user_in_sheet(phone: str, new_email: str | None = None, new_password:
         client = get_google_sheets_client()
         if not client:
             return False
-        spreadsheet = client.open_by_key(USERS_SPREADSHEET_ID)
-        worksheet = spreadsheet.sheet1
-        # 헤더와 행 전체를 가져와 인덱스 탐색
-        all_values = worksheet.get_all_values()
-        if not all_values:
-            return False
-        header = all_values[0]
-        phone_col = header.index('휴대폰번호') + 1 if '휴대폰번호' in header else None
-        email_col = header.index('회사메일') + 1 if '회사메일' in header else None
-        pw_col = header.index('비밀번호') + 1 if '비밀번호' in header else None
-        if not phone_col:
-            return False
-        target_row = None
-        for i in range(2, len(all_values) + 1):
-            if worksheet.cell(i, phone_col).value == str(phone):
-                target_row = i
-                break
-        if not target_row:
-            return False
-        updates = []
-        if new_email is not None and email_col:
-            updates.append({'range': f"R{target_row}C{email_col}", 'values': [[new_email]]})
-        if new_password is not None and pw_col:
-            updates.append({'range': f"R{target_row}C{pw_col}", 'values': [[new_password]]})
-        if not updates:
+        
+        def _update_user():
+            spreadsheet = client.open_by_key(USERS_SPREADSHEET_ID)
+            worksheet = spreadsheet.sheet1
+            # 헤더와 행 전체를 가져와 인덱스 탐색
+            all_values = worksheet.get_all_values()
+            if not all_values:
+                return False
+            header = all_values[0]
+            phone_col = header.index('휴대폰번호') + 1 if '휴대폰번호' in header else None
+            email_col = header.index('회사메일') + 1 if '회사메일' in header else None
+            pw_col = header.index('비밀번호') + 1 if '비밀번호' in header else None
+            if not phone_col:
+                return False
+            target_row = None
+            for i in range(2, len(all_values) + 1):
+                if worksheet.cell(i, phone_col).value == str(phone):
+                    target_row = i
+                    break
+            if not target_row:
+                return False
+            updates = []
+            if new_email is not None and email_col:
+                updates.append({'range': f"R{target_row}C{email_col}", 'values': [[new_email]]})
+            if new_password is not None and pw_col:
+                updates.append({'range': f"R{target_row}C{pw_col}", 'values': [[new_password]]})
+            if not updates:
+                return True
+            worksheet.batch_update([{
+                'range': u['range'],
+                'values': u['values']
+            } for u in updates])
             return True
-        worksheet.batch_update([{
-            'range': u['range'],
-            'values': u['values']
-        } for u in updates])
-        return True
+        
+        return _sheets_call_with_retry(_update_user)
     except Exception as e:
-        st.error(f"사용자 정보 업데이트 오류: {e}")
+        error_msg = str(e).lower()
+        if _is_retryable_error(error_msg):
+            st.warning("사용자 정보 업데이트 중 호출 제한이 발생했습니다. 잠시 후 다시 시도해주세요.")
+        else:
+            st.error(f"사용자 정보 업데이트 오류: {e}")
         return False
 
 def get_user_phone_from_google_sheet(email: str | None = None, name: str | None = None):
@@ -297,12 +350,8 @@ def get_user_phone_from_google_sheet(email: str | None = None, name: str | None 
     - 휴대폰번호, 비밀번호, 이름(본명), 회사메일, 권한, 타임스탬프, 표시여부
     """
     try:
-        client = get_google_sheets_client()
-        if not client:
-            return None
-        spreadsheet = client.open_by_key(USERS_SPREADSHEET_ID)
-        worksheet = spreadsheet.sheet1
-        records = worksheet.get_all_records()
+        # 캐시된 사용자 목록 사용
+        records = _users_records_cached(USERS_SPREADSHEET_ID)
         # 이메일로 우선 매칭
         if email:
             for row in records:
@@ -561,9 +610,14 @@ def ensure_google_sheets_connection():
     if not client:
         st.session_state.google_sheets_connected = False
         return
-    try:
+    
+    def _test_connection():
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         _ = spreadsheet.sheet1
+        return True
+    
+    try:
+        _sheets_call_with_retry(_test_connection)
         st.session_state.google_sheets_connected = True
     except Exception:
         st.session_state.google_sheets_connected = False
@@ -733,6 +787,15 @@ def logout_and_clear_cache():
     # 캐시 파일 삭제
     _clear_cache()
 
+def _filter_user_archive(df, user_name):
+    """DataFrame에서 사용자 데이터만 필터링합니다."""
+    if df is None or df.empty:
+        return []
+    if '이름' in df.columns:
+        user_archive = df[df['이름'] == user_name]
+        return user_archive.to_dict('records') if not user_archive.empty else []
+    return df.to_dict('records')
+
 def refresh_archive_cache():
     """Snippet 아카이브 캐시를 갱신합니다."""
     try:
@@ -748,43 +811,29 @@ def refresh_archive_cache():
         # Snippet 아카이브 데이터 갱신
         try:
             import Archive
-            if st.session_state.google_sheets_connected:
-                archive_df = Archive.get_snippets_from_google_sheets(get_google_sheets_client, SPREADSHEET_ID)
-                if archive_df is not None and not archive_df.empty:
-                    # 사용자 데이터만 필터링
-                    if '이름' in archive_df.columns:
-                        user_archive = archive_df[archive_df['이름'] == user_name]
-                        st.session_state.prefetch_cache['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
-                    else:
-                        st.session_state.prefetch_cache['archive'] = archive_df.to_dict('records')
-                else:
-                    # Google Sheets 실패 시 로컬 CSV 시도
+            archive_df = None
+            
+            # Google Sheets에서 가져오기 시도
+            if st.session_state.get('google_sheets_connected', False):
+                try:
+                    archive_df = Archive.get_snippets_from_google_sheets(get_google_sheets_client, SPREADSHEET_ID)
+                except Exception:
+                    archive_df = None
+            
+            # 로컬 CSV에서 가져오기 (Google Sheets 실패 시 또는 미연결 시)
+            if archive_df is None or (hasattr(archive_df, 'empty') and archive_df.empty):
+                try:
                     archive_df = Archive.get_snippets_from_local_csv()
-                    if archive_df is not None and not archive_df.empty:
-                        if '이름' in archive_df.columns:
-                            user_archive = archive_df[archive_df['이름'] == user_name]
-                            st.session_state.prefetch_cache['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
-                        else:
-                            st.session_state.prefetch_cache['archive'] = archive_df.to_dict('records')
-                    else:
-                        st.session_state.prefetch_cache['archive'] = []
-            else:
-                # Google Sheets 미연결 시 로컬 CSV 시도
-                archive_df = Archive.get_snippets_from_local_csv()
-                if archive_df is not None and not archive_df.empty:
-                    if '이름' in archive_df.columns:
-                        user_archive = archive_df[archive_df['이름'] == user_name]
-                        st.session_state.prefetch_cache['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
-                    else:
-                        st.session_state.prefetch_cache['archive'] = archive_df.to_dict('records')
-                else:
-                    st.session_state.prefetch_cache['archive'] = []
-        except Exception as e:
+                except Exception:
+                    archive_df = None
+            
+            st.session_state.prefetch_cache['archive'] = _filter_user_archive(archive_df, user_name)
+        except Exception:
             st.session_state.prefetch_cache['archive'] = []
         
         # 캐시 파일에 저장
         touch_session_active()
-    except Exception as e:
+    except Exception:
         # 아카이브 캐시 갱신 실패해도 계속 진행
         pass
 
@@ -805,19 +854,18 @@ def refresh_cdp_cache():
             import cdp
             cdp_df = cdp._fetch_cdp_dataframe()
             if cdp_df is not None and not cdp_df.empty:
-                # 사용자 데이터만 필터링
                 normalized = {c.strip(): c for c in cdp_df.columns}
                 name_col = normalized.get("이름") or normalized.get("name") or list(cdp_df.columns)[0]
                 user_cdp = cdp_df[cdp_df[name_col] == user_name]
                 st.session_state.prefetch_cache['cdp'] = user_cdp.to_dict('records') if not user_cdp.empty else []
             else:
                 st.session_state.prefetch_cache['cdp'] = []
-        except Exception as e:
+        except Exception:
             st.session_state.prefetch_cache['cdp'] = []
         
         # 캐시 파일에 저장
         touch_session_active()
-    except Exception as e:
+    except Exception:
         # CDP 캐시 갱신 실패해도 계속 진행
         pass
 
@@ -838,7 +886,6 @@ def refresh_idp_cache():
             import idp_usage
             idp_df = idp_usage.fetch_idp_dataframe()
             if idp_df is not None and not idp_df.empty:
-                # 사용자 데이터만 필터링
                 if '이름' in idp_df.columns:
                     user_idp = idp_df[idp_df['이름'] == user_name]
                     st.session_state.prefetch_cache['idp'] = user_idp.to_dict('records') if not user_idp.empty else []
@@ -846,12 +893,12 @@ def refresh_idp_cache():
                     st.session_state.prefetch_cache['idp'] = idp_df.to_dict('records')
             else:
                 st.session_state.prefetch_cache['idp'] = []
-        except Exception as e:
+        except Exception:
             st.session_state.prefetch_cache['idp'] = []
         
         # 캐시 파일에 저장
         touch_session_active()
-    except Exception as e:
+    except Exception:
         # IDP 캐시 갱신 실패해도 계속 진행
         pass
 
@@ -868,27 +915,24 @@ def prefetch_user_data():
         # 1. Snippet 아카이브 데이터 Pre-fetching
         try:
             import Archive
-            if st.session_state.google_sheets_connected:
-                archive_df = Archive.get_snippets_from_google_sheets(get_google_sheets_client, SPREADSHEET_ID)
-                if archive_df is not None and not archive_df.empty:
-                    # 사용자 데이터만 필터링
-                    if '이름' in archive_df.columns:
-                        user_archive = archive_df[archive_df['이름'] == user_name]
-                        prefetch_data['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
-                    else:
-                        prefetch_data['archive'] = archive_df.to_dict('records')
-                else:
-                    # Google Sheets 실패 시 로컬 CSV 시도
+            archive_df = None
+            
+            # Google Sheets에서 가져오기 시도
+            if st.session_state.get('google_sheets_connected', False):
+                try:
+                    archive_df = Archive.get_snippets_from_google_sheets(get_google_sheets_client, SPREADSHEET_ID)
+                except Exception:
+                    archive_df = None
+            
+            # 로컬 CSV에서 가져오기 (Google Sheets 실패 시 또는 미연결 시)
+            if archive_df is None or (hasattr(archive_df, 'empty') and archive_df.empty):
+                try:
                     archive_df = Archive.get_snippets_from_local_csv()
-                    if archive_df is not None and not archive_df.empty:
-                        if '이름' in archive_df.columns:
-                            user_archive = archive_df[archive_df['이름'] == user_name]
-                            prefetch_data['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
-                        else:
-                            prefetch_data['archive'] = archive_df.to_dict('records')
-                    else:
-                        prefetch_data['archive'] = []
-        except Exception as e:
+                except Exception:
+                    archive_df = None
+            
+            prefetch_data['archive'] = _filter_user_archive(archive_df, user_name)
+        except Exception:
             prefetch_data['archive'] = []
         
         # 2. CDP 데이터 Pre-fetching
@@ -1088,15 +1132,8 @@ def render_login():
                             st.session_state.viewing_user_info = user_info.copy()
                             st.session_state.selected_user_name = user_info.get('name', '')
                             
-                            # 관리자인 경우 모든 사용자 캐시 백그라운드 생성
-                            if user_info.get('role', '').strip() == 'admin':
-                                try:
-                                    import importlib
-                                    oneon1_module = importlib.import_module('1on1')
-                                    if hasattr(oneon1_module, 'prefetch_all_users_cache'):
-                                        oneon1_module.prefetch_all_users_cache()
-                                except Exception:
-                                    pass  # 에러 발생해도 계속 진행
+                            # 관리자 대량 프리페치는 비활성화 (선택 기반으로 지연 로딩)
+                            # 관리자 로그인 즉시 전체 사용자 캐시 생성을 하지 않습니다.
                             
                             # 로그인 성공 시 즉시 Daily Snippet 기록 페이지로 이동 (사이드바 버튼 효과)
                             st.session_state.logging_in = False
@@ -1105,8 +1142,8 @@ def render_login():
                             st.session_state.last_page = "daily_snippet"
                             reset_page_state("daily_snippet")
                             st.session_state.scroll_to_top = True
-                            # 백그라운드 prefetch 트리거 설정
-                            st.session_state.prefetch_trigger = True
+                            # 백그라운드 prefetch 트리거 설정 (관리자는 지연)
+                            st.session_state.prefetch_trigger = user_info.get('role', '').strip() != 'admin'
                             
                             # 최소한의 캐시만 저장 (빠른 응답을 위해)
                             st.session_state.last_active = _now_iso()
@@ -1186,7 +1223,7 @@ def render_sidebar():
                                 del st.session_state.admin_target_users
                             st.rerun()
                     
-                    # 선택된 사용자가 변경되면 세션 업데이트
+                    # 선택된 사용자가 변경되면 세션 업데이트 및 즉시 아카이브 열기
                     if selected_name != st.session_state.selected_user_name:
                         st.session_state.selected_user_name = selected_name
                         # 선택된 사용자의 전체 정보 가져오기
@@ -1216,6 +1253,12 @@ def render_sidebar():
                                     # 사용자별 캐시가 없으면 일반 캐시 초기화
                                     if 'prefetch_cache' in st.session_state:
                                         del st.session_state.prefetch_cache
+                                # 선택 즉시 아카이브 캐시 준비 및 페이지 열기
+                                try:
+                                    refresh_archive_cache()
+                                except Exception:
+                                    pass
+                                navigate_to_page("archive")
                                 st.rerun()
                                 break
                     
@@ -1238,6 +1281,22 @@ def render_sidebar():
             navigate_to_page("daily_snippet")
           
         if st.button("📚 Snippet 아카이브", use_container_width=True):
+            # 관리자 선택 사용자 기준으로 viewing_user 설정
+            target_name = None
+            try:
+                if 'selected_user_name' in st.session_state and str(st.session_state.selected_user_name).strip():
+                    target_name = str(st.session_state.selected_user_name).strip()
+            except Exception:
+                target_name = None
+            if not target_name and st.session_state.get('user_info'):
+                target_name = str(st.session_state.user_info.get('name', '')).strip()
+            if target_name:
+                st.session_state.viewing_user_info = {'name': target_name}
+                # 선택 사용자 아카이브 캐시 선준비
+                try:
+                    refresh_archive_cache()
+                except Exception:
+                    pass
             navigate_to_page("archive")
         
         if st.button("📊 CDP", use_container_width=True):
@@ -1251,6 +1310,18 @@ def render_sidebar():
         
         # 동일 계위 메뉴: Goal & Policy 다음 - 1on1 코칭
         if st.button("👥 1on1 코칭", use_container_width=True):
+            # 현재 선택된 사용자 기준으로 viewing_user 설정
+            target_name = None
+            try:
+                if 'selected_user_name' in st.session_state and str(st.session_state.selected_user_name).strip():
+                    target_name = str(st.session_state.selected_user_name).strip()
+            except Exception:
+                target_name = None
+            if not target_name and st.session_state.get('user_info'):
+                target_name = str(st.session_state.user_info.get('name', '')).strip()
+            if target_name:
+                st.session_state.viewing_user_info = {'name': target_name}
+                # 캐시는 메인 화면에서 로딩 (사이드바에서는 호출하지 않음)
             navigate_to_page("one_on_one_coaching")
        
         

@@ -11,6 +11,8 @@ from docx.shared import Pt
 from docx.oxml.ns import qn
 from io import BytesIO
 import re
+import random
+import time
 
 # 메인 컨텐츠 최대 너비 제한 (우측 영역)
 st.markdown(
@@ -124,6 +126,64 @@ if GEMINI_API_KEY:
     except Exception:
         pass
 
+# Google Sheets 호출 재시도 유틸리티 (429 Quota 초과 완화)
+def _is_retryable_error(error_msg: str) -> bool:
+    """재시도 가능한 오류인지 확인합니다."""
+    msg_lower = error_msg.lower()
+    return ('429' in msg_lower) or ('quota' in msg_lower) or ('rate' in msg_lower and 'limit' in msg_lower)
+
+def _sheets_call_with_retry(callable_fn, *args, **kwargs):
+    """Google Sheets API 호출을 지수 백오프로 재시도합니다."""
+    # 즉시 1회 + 1s, 2s, 4s, 8s, 16s 지연 재시도 (총 6회) + 지터
+    delays = [0, 1, 2, 4, 8, 16]
+    last_error = None
+    for delay in delays:
+        if delay > 0:
+            time.sleep(delay + random.uniform(0, 0.5))
+        try:
+            return callable_fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+            # 429 또는 쿼터/레이트리밋 문구가 있으면 재시도, 그 외 즉시 중단
+            if _is_retryable_error(error_msg):
+                continue
+            # 기타 오류는 즉시 전파
+            raise
+    # 재시도 모두 실패 시 마지막 오류 전파
+    if last_error:
+        raise last_error
+    raise RuntimeError("Google Sheets API 호출이 실패했습니다.")
+
+# 세션 단위 Google Sheets Read 레이트 리미터
+def _sheets_read_rate_limit_allow(max_reads_per_minute=8):
+    """세션 단위로 분당 읽기 호출 횟수를 제한합니다. 허용되면 0, 대기 필요 초를 반환."""
+    now = time.time()
+    key = '_sheets_read_timestamps'
+    ts_list = st.session_state.get(key) or []
+    # 60초 윈도우만 유지
+    ts_list = [t for t in ts_list if now - t < 60]
+    st.session_state[key] = ts_list
+    if len(ts_list) < max_reads_per_minute:
+        ts_list.append(now)
+        st.session_state[key] = ts_list
+        return 0.0
+    # 남은 대기 시간 계산
+    earliest = min(ts_list) if ts_list else now
+    wait = max(0.0, 60 - (now - earliest))
+    return wait
+
+# 앱 레벨 캐시: 시트 전체 레코드 조회 결과 캐싱 (다중 세션 완화)
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_sheet_records(spreadsheet_id: str, worksheet_name: str):
+    client = get_google_sheets_client()
+    if not client:
+        return []
+    spreadsheet = _sheets_call_with_retry(client.open_by_key, spreadsheet_id)
+    worksheet = _sheets_call_with_retry(spreadsheet.worksheet, worksheet_name)
+    records = _sheets_call_with_retry(worksheet.get_all_records)
+    return records or []
+
 # 1on1 코칭 스프레드시트 ID는 함수에서 동적으로 가져옵니다 (안전성을 위해)
 def get_oneon1_spreadsheet_id():
     """1on1 코칭 스프레드시트 ID를 안전하게 가져옵니다."""
@@ -222,6 +282,24 @@ def get_google_sheets_client():
 def get_oneon1_dataframe():
     """1on1 코칭 데이터를 Google Sheets에서 가져옵니다."""
     try:
+        # 세션 캐시 활용(동일 사용자 반복 조회 시 과도한 호출 방지)
+        cache = st.session_state.get('_oneon1_cache') or {}
+        cache_ttl_seconds = 300  # 5분 TTL
+        if cache and isinstance(cache, dict):
+            cached_ts = cache.get('ts')
+            cached_df = cache.get('df')
+            if cached_ts and (time.time() - float(cached_ts) < cache_ttl_seconds) and cached_df is not None:
+                return cached_df
+
+        # 세션 레이트 리미터: 분당 읽기 횟수 제한
+        wait_secs = _sheets_read_rate_limit_allow(max_reads_per_minute=6)
+        if wait_secs > 0:
+            # 캐시가 있으면 즉시 캐시 반환
+            if cache and cache.get('df') is not None:
+                return cache.get('df')
+            # 캐시가 없으면 최소 대기 후 진행
+            time.sleep(min(wait_secs, 2.0))
+
         spreadsheet_id = get_oneon1_spreadsheet_id()
         if not spreadsheet_id:
             return None
@@ -230,11 +308,22 @@ def get_oneon1_dataframe():
         if not client:
             return None
         
-        spreadsheet = client.open_by_key(spreadsheet_id)
-        worksheet = spreadsheet.worksheet("Sheet1")
-        records = worksheet.get_all_records()
-        return pd.DataFrame(records)
+        # 앱 레벨 캐시를 우선 사용해 호출 횟수 최소화
+        records = _cached_sheet_records(spreadsheet_id, "Sheet1")
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records)
+        # 캐시에 저장
+        st.session_state['_oneon1_cache'] = {'ts': time.time(), 'df': df}
+        return df
     except Exception as e:
+        # 429/쿼터 초과 시, 만료된 캐시라도 안전 반환
+        error_msg = str(e).lower()
+        cache = st.session_state.get('_oneon1_cache') or {}
+        cached_df = cache.get('df') if isinstance(cache, dict) else None
+        if _is_retryable_error(error_msg) and cached_df is not None:
+            st.warning("최근 호출 제한으로 인해 캐시된 데이터를 표시합니다 (일시적으로 최신이 아닐 수 있음).")
+            return cached_df
         st.error(f"1on1 데이터 로드 오류: {e}")
         return None
 
@@ -250,11 +339,17 @@ def save_oneon1_record(data):
         if not client:
             return False
         
-        spreadsheet = client.open_by_key(spreadsheet_id)
-        worksheet = spreadsheet.worksheet("Sheet1")
+        # 쓰기 전용은 캐시 우회하되 재시도 유지
+        spreadsheet = _sheets_call_with_retry(client.open_by_key, spreadsheet_id)
+        worksheet = _sheets_call_with_retry(spreadsheet.worksheet, "Sheet1")
+        _sheets_call_with_retry(worksheet.append_row, data)
         
-        # 데이터를 행으로 추가
-        worksheet.append_row(data)
+        # 쓰기 성공 시 읽기 캐시 무효화
+        if '_oneon1_cache' in st.session_state:
+            try:
+                del st.session_state['_oneon1_cache']
+            except Exception:
+                st.session_state['_oneon1_cache'] = {}
         return True
     except Exception as e:
         st.error(f"1on1 기록 저장 오류: {e}")
@@ -862,6 +957,9 @@ def format_cache_data_for_prompt(cache_data, data_type):
     if not cache_data:
         return "데이터 없음"
     
+    # 동료 칭찬 관련 필드명 목록 (다양한 형태 대응)
+    exclude_fields = ['동료칭찬', '동료 칭찬', '[Praise] 동료 칭찬', 'colleague_praise', 'Colleague Praise', 'COLLEAGUE_PRAISE']
+    
     if isinstance(cache_data, list):
         if len(cache_data) == 0:
             return "데이터 없음"
@@ -869,11 +967,17 @@ def format_cache_data_for_prompt(cache_data, data_type):
         formatted = []
         for record in cache_data:
             if isinstance(record, dict):
-                record_str = "\n".join([f"  - {k}: {v}" for k, v in record.items() if v and str(v).strip()])
+                # 동료 칭찬 필드 제외
+                filtered_record = {k: v for k, v in record.items() 
+                                   if k not in exclude_fields and v and str(v).strip()}
+                record_str = "\n".join([f"  - {k}: {v}" for k, v in filtered_record.items()])
                 formatted.append(record_str)
         return "\n---\n".join(formatted)
     elif isinstance(cache_data, dict):
-        return "\n".join([f"  - {k}: {v}" for k, v in cache_data.items() if v and str(v).strip()])
+        # 동료 칭찬 필드 제외
+        filtered_data = {k: v for k, v in cache_data.items() 
+                        if k not in exclude_fields and v and str(v).strip()}
+        return "\n".join([f"  - {k}: {v}" for k, v in filtered_data.items()])
     else:
         return str(cache_data)
 
@@ -1104,6 +1208,91 @@ def create_word_document_from_feedback(feedback_text, title):
     doc_io.seek(0)
     return doc_io.getvalue()
 
+def _get_available_gemini_models():
+    """사용 가능한 Gemini 모델 목록을 반환합니다."""
+    try:
+        available_models = genai.list_models()
+        model_names = []
+        for m in available_models:
+            model_name = m.name
+            if model_name.startswith('models/'):
+                model_name = model_name.replace('models/', '')
+            
+            if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods:
+                if 'exp' not in model_name.lower() and '2.0' not in model_name.lower():
+                    if 'flash' in model_name.lower():
+                        model_names.insert(0, model_name)
+                    elif 'pro' in model_name.lower():
+                        model_names.append(model_name)
+                    else:
+                        model_names.append(model_name)
+        return model_names if model_names else ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+    except Exception:
+        return ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+
+def _call_gemini_api(prompt: str):
+    """Gemini API를 호출하여 응답을 반환합니다."""
+    model_names_to_try = _get_available_gemini_models()
+    last_error = None
+    response = None
+    
+    for model_name in model_names_to_try:
+        try:
+            full_model_name = f"models/{model_name}" if not model_name.startswith('models/') else model_name
+            model = genai.GenerativeModel(full_model_name)
+            response = model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "top_k": 40,
+                }
+            )
+            if response:
+                break
+        except Exception as e:
+            error_msg = str(e)
+            last_error = error_msg
+            
+            # 403 오류 (API 키 문제) - 즉시 중단
+            if '403' in error_msg or 'leaked' in error_msg.lower() or 'reported' in error_msg.lower():
+                raise ValueError(f"API 키 오류가 발생했습니다: {error_msg}. 새로운 API 키를 발급받아 설정해주세요.")
+            
+            # Computer Use 관련 오류는 이 모델을 건너뛰기
+            if 'Computer Use' in error_msg or 'computer-use' in error_msg.lower():
+                continue
+            # 404 오류는 다른 모델 시도
+            if '404' in error_msg or 'not found' in error_msg.lower():
+                continue
+            # 다른 오류도 일단 건너뛰고 다음 모델 시도
+            continue
+    
+    if response is None:
+        available_info = ""
+        try:
+            available_models = genai.list_models()
+            available_names = [m.name for m in available_models if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods]
+            if available_names:
+                available_info = f" 사용 가능한 모델: {available_names[:5]}"
+        except Exception:
+            pass
+        raise RuntimeError(f"사용 가능한 Gemini 모델을 찾을 수 없습니다. 마지막 오류: {last_error}. 시도한 모델: {model_names_to_try}.{available_info}")
+    
+    return response
+
+def _extract_response_text(response):
+    """응답 객체에서 텍스트를 추출합니다."""
+    if hasattr(response, 'text'):
+        return response.text
+    elif hasattr(response, 'candidates') and len(response.candidates) > 0:
+        candidate = response.candidates[0]
+        if hasattr(candidate, 'content'):
+            if hasattr(candidate.content, 'parts'):
+                return candidate.content.parts[0].text
+            return str(candidate.content)
+        return str(candidate)
+    return str(response)
+
 def get_performance_coaching_feedback():
     """성과 코칭 피드백을 생성합니다."""
     try:
@@ -1186,109 +1375,20 @@ def get_performance_coaching_feedback():
 피드백은 구체적이고 실행 가능한 내용으로 작성해주세요. 한국어로 답변해주세요."""
 
         # Gemini API 호출
-        # 사용 가능한 모델 목록 확인
-        model = None
-        model_names_to_try = []
-        last_error = None
-        response = None
-        
-        # 먼저 사용 가능한 모델 목록 가져오기
-        try:
-            available_models = genai.list_models()
-            # generateContent를 지원하고 Computer Use가 필요없는 모델 찾기
-            for m in available_models:
-                model_name = m.name
-                # models/ 접두사 제거
-                if model_name.startswith('models/'):
-                    model_name = model_name.replace('models/', '')
-                
-                # generateContent를 지원하는 모델만
-                if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods:
-                    # Computer Use 관련 모델 제외 (exp, 2.0-exp 등)
-                    if 'exp' not in model_name.lower() and '2.0' not in model_name.lower():
-                        if 'flash' in model_name.lower():
-                            model_names_to_try.insert(0, model_name)  # flash 모델 우선
-                        elif 'pro' in model_name.lower():
-                            model_names_to_try.append(model_name)
-                        else:
-                            model_names_to_try.append(model_name)
-        except Exception as e:
-            # ListModels 실패 시 기본 모델 시도
-            model_names_to_try = [
-                'gemini-1.5-flash',
-                'gemini-1.5-pro',
-                'gemini-pro'
-            ]
-        
-        # 만약 목록이 비어있으면 기본 모델 추가
-        if not model_names_to_try:
-            model_names_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-        
-        # 모델명 시도 (Computer Use 오류 감지 및 건너뛰기)
-        for model_name in model_names_to_try:
-            try:
-                model = genai.GenerativeModel(model_name)
-                # Computer Use 없이 텍스트 생성만 시도
-                response = model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.7,
-                        "top_p": 0.8,
-                        "top_k": 40,
-                    }
-                )
-                # 성공적으로 응답을 받았으면 이 모델 사용
-                if response:
-                    break
-            except Exception as e:
-                error_msg = str(e)
-                last_error = error_msg
-                # Computer Use 관련 오류는 이 모델을 건너뛰기
-                if 'Computer Use' in error_msg or 'computer-use' in error_msg.lower():
-                    model = None
-                    response = None
-                    continue
-                # 404 오류는 다른 모델 시도
-                if '404' in error_msg or 'not found' in error_msg.lower():
-                    model = None
-                    response = None
-                    continue
-                # 다른 오류도 일단 건너뛰고 다음 모델 시도
-                model = None
-                response = None
-                continue
-        
-        if model is None or response is None:
-            # 사용 가능한 모델 목록 정보 추가
-            available_info = ""
-            try:
-                available_models = genai.list_models()
-                available_names = [m.name for m in available_models if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods]
-                if available_names:
-                    available_info = f" 사용 가능한 모델: {available_names[:5]}"
-            except:
-                pass
-            raise Exception(f"사용 가능한 Gemini 모델을 찾을 수 없습니다. 마지막 오류: {last_error}. 시도한 모델: {model_names_to_try}.{available_info} API 키와 모델 접근 권한을 확인해주세요.")
+        response = _call_gemini_api(prompt)
         
         # 응답 텍스트 추출
-        if hasattr(response, 'text'):
-            feedback_text = response.text
-        elif hasattr(response, 'candidates') and len(response.candidates) > 0:
-            if hasattr(response.candidates[0], 'content'):
-                if hasattr(response.candidates[0].content, 'parts'):
-                    feedback_text = response.candidates[0].content.parts[0].text
-                else:
-                    feedback_text = str(response.candidates[0].content)
-            else:
-                feedback_text = str(response.candidates[0])
-        else:
-            feedback_text = str(response)
+        feedback_text = _extract_response_text(response)
         
         # 피드백 텍스트 필터링 (년차, 나이 관련 표현 제거)
         feedback_text = filter_feedback_text(feedback_text)
         
         return feedback_text, None
         
+    except ValueError as e:
+        return None, str(e)
+    except RuntimeError as e:
+        return None, str(e)
     except Exception as e:
         return None, f"피드백 생성 중 오류가 발생했습니다: {str(e)}"
 
@@ -1371,103 +1471,10 @@ def get_growth_coaching_feedback():
 피드백은 구체적이고 실행 가능한 내용으로 작성하고, 격려와 응원의 메시지를 포함해주세요. 한국어로 답변해주세요."""
 
         # Gemini API 호출
-        # 사용 가능한 모델 목록 확인
-        model = None
-        model_names_to_try = []
-        last_error = None
-        response = None
-        
-        # 먼저 사용 가능한 모델 목록 가져오기
-        try:
-            available_models = genai.list_models()
-            # generateContent를 지원하고 Computer Use가 필요없는 모델 찾기
-            for m in available_models:
-                model_name = m.name
-                # models/ 접두사 제거
-                if model_name.startswith('models/'):
-                    model_name = model_name.replace('models/', '')
-                
-                # generateContent를 지원하는 모델만
-                if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods:
-                    # Computer Use 관련 모델 제외 (exp, 2.0-exp 등)
-                    if 'exp' not in model_name.lower() and '2.0' not in model_name.lower():
-                        if 'flash' in model_name.lower():
-                            model_names_to_try.insert(0, model_name)  # flash 모델 우선
-                        elif 'pro' in model_name.lower():
-                            model_names_to_try.append(model_name)
-                        else:
-                            model_names_to_try.append(model_name)
-        except Exception as e:
-            # ListModels 실패 시 기본 모델 시도
-            model_names_to_try = [
-                'gemini-1.5-flash',
-                'gemini-1.5-pro',
-                'gemini-pro'
-            ]
-        
-        # 만약 목록이 비어있으면 기본 모델 추가
-        if not model_names_to_try:
-            model_names_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
-        
-        # 모델명 시도 (Computer Use 오류 감지 및 건너뛰기)
-        for model_name in model_names_to_try:
-            try:
-                model = genai.GenerativeModel(model_name)
-                # Computer Use 없이 텍스트 생성만 시도
-                response = model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.7,
-                        "top_p": 0.8,
-                        "top_k": 40,
-                    }
-                )
-                # 성공적으로 응답을 받았으면 이 모델 사용
-                if response:
-                    break
-            except Exception as e:
-                error_msg = str(e)
-                last_error = error_msg
-                # Computer Use 관련 오류는 이 모델을 건너뛰기
-                if 'Computer Use' in error_msg or 'computer-use' in error_msg.lower():
-                    model = None
-                    response = None
-                    continue
-                # 404 오류는 다른 모델 시도
-                if '404' in error_msg or 'not found' in error_msg.lower():
-                    model = None
-                    response = None
-                    continue
-                # 다른 오류도 일단 건너뛰고 다음 모델 시도
-                model = None
-                response = None
-                continue
-        
-        if model is None or response is None:
-            # 사용 가능한 모델 목록 정보 추가
-            available_info = ""
-            try:
-                available_models = genai.list_models()
-                available_names = [m.name for m in available_models if hasattr(m, 'supported_generation_methods') and 'generateContent' in m.supported_generation_methods]
-                if available_names:
-                    available_info = f" 사용 가능한 모델: {available_names[:5]}"
-            except:
-                pass
-            raise Exception(f"사용 가능한 Gemini 모델을 찾을 수 없습니다. 마지막 오류: {last_error}. 시도한 모델: {model_names_to_try}.{available_info} API 키와 모델 접근 권한을 확인해주세요.")
+        response = _call_gemini_api(prompt)
         
         # 응답 텍스트 추출
-        if hasattr(response, 'text'):
-            feedback_text = response.text
-        elif hasattr(response, 'candidates') and len(response.candidates) > 0:
-            if hasattr(response.candidates[0], 'content'):
-                if hasattr(response.candidates[0].content, 'parts'):
-                    feedback_text = response.candidates[0].content.parts[0].text
-                else:
-                    feedback_text = str(response.candidates[0].content)
-            else:
-                feedback_text = str(response.candidates[0])
-        else:
-            feedback_text = str(response)
+        feedback_text = _extract_response_text(response)
         
         # 피드백 텍스트 확인
         if not feedback_text or not feedback_text.strip():
@@ -1478,9 +1485,8 @@ def get_growth_coaching_feedback():
         
         # 필터링 후에도 빈 문자열이면 원본 반환
         if not filtered_text or not filtered_text.strip():
-            # 필터링으로 모든 내용이 삭제된 경우 원본 사용 (하지만 여전히 빈 경우 에러)
             if feedback_text and feedback_text.strip():
-                feedback_text = feedback_text  # 원본 사용
+                feedback_text = feedback_text
             else:
                 return None, "피드백 생성에 실패했습니다. 데이터를 확인해주세요."
         else:
@@ -1488,6 +1494,10 @@ def get_growth_coaching_feedback():
         
         return feedback_text, None
         
+    except ValueError as e:
+        return None, str(e)
+    except RuntimeError as e:
+        return None, str(e)
     except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
@@ -1676,8 +1686,192 @@ def render_growth_feedback_auto():
         else:
             st.warning("피드백을 생성할 수 없습니다.")
 
+def _get_main_module():
+    """main 모듈을 가져옵니다."""
+    import sys
+    main_module = sys.modules.get('main')
+    if not main_module:
+        try:
+            import main as main_mod
+            main_module = main_mod
+        except Exception:
+            pass
+    if not main_module:
+        try:
+            import importlib
+            main_module = importlib.import_module('main')
+        except Exception:
+            pass
+    return main_module
+
+def _get_spreadsheet_id():
+    """스프레드시트 ID를 가져옵니다."""
+    main_module = _get_main_module()
+    spreadsheet_id = getattr(main_module, 'SPREADSHEET_ID', None) if main_module else None
+    return spreadsheet_id or "1THmwStR6p0_SUyLEV6-edT0kigANvTCPOkAzN7NaEQE"
+
+def _load_archive_data(user_name: str, prefetch_cache: dict):
+    """Snippet 아카이브 데이터를 로드합니다."""
+    try:
+        import Archive
+        
+        # 스프레드시트 ID 가져오기
+        spreadsheet_id = _get_spreadsheet_id()
+        main_module = _get_main_module()
+        get_client = getattr(main_module, 'get_google_sheets_client', None) if main_module else None
+        
+        archive_df = None
+        
+        # 세션 캐시 확인 (5분 TTL)
+        arch_cache = st.session_state.get('_archive_all_cache') or {}
+        arch_ttl = 300
+        if arch_cache and isinstance(arch_cache, dict):
+            ats = arch_cache.get('ts')
+            adf = arch_cache.get('df')
+            if ats and (time.time() - float(ats) < arch_ttl) and adf is not None:
+                archive_df = pd.DataFrame(adf)
+        
+        # Google Sheets에서 로드
+        if get_client and spreadsheet_id and archive_df is None:
+            try:
+                if callable(get_client):
+                    archive_df = Archive.get_snippets_from_google_sheets(get_client, spreadsheet_id)
+                else:
+                    client = get_client() if callable(get_client) else get_client
+                    if client:
+                        spreadsheet = client.open_by_key(spreadsheet_id)
+                        worksheet = spreadsheet.worksheet("Sheet1")
+                        records = worksheet.get_all_records()
+                        archive_df = pd.DataFrame(records)
+            except Exception:
+                archive_df = None
+        
+        # 로컬 CSV에서 로드
+        if archive_df is None or (hasattr(archive_df, 'empty') and archive_df.empty):
+            try:
+                archive_df = Archive.get_snippets_from_local_csv()
+            except Exception:
+                archive_df = None
+        
+        # 사용자 데이터 필터링
+        if archive_df is not None and not archive_df.empty:
+            # 전체 데이터 세션 캐시 저장 (메모리 효율을 위해 전체 저장은 선택적)
+            try:
+                st.session_state['_archive_all_cache'] = {'ts': time.time(), 'df': archive_df.to_dict('records')}
+            except Exception:
+                # 메모리 부족 시 캐시 저장 건너뛰기
+                pass
+            
+            # 이름 컬럼 찾기
+            name_column = None
+            for col in archive_df.columns:
+                col_clean = str(col).strip().lower()
+                if '이름' in str(col) or 'name' in col_clean:
+                    name_column = col
+                    break
+            
+            if name_column:
+                user_archive = archive_df[archive_df[name_column] == user_name]
+                if user_archive.empty:
+                    # 부분 매칭 시도
+                    user_name_clean = str(user_name).strip()
+                    for idx, row in archive_df.iterrows():
+                        row_name = str(row[name_column]).strip() if pd.notna(row[name_column]) else ""
+                        if user_name_clean == row_name:
+                            user_archive = archive_df[archive_df.index == idx]
+                            break
+                prefetch_cache['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
+            else:
+                prefetch_cache['archive'] = archive_df.to_dict('records')
+        else:
+            prefetch_cache['archive'] = []
+    except Exception:
+        prefetch_cache['archive'] = []
+
+def _load_other_data(user_name: str, prefetch_cache: dict):
+    """CDP, IDP, Mission & KPI, Ground Rule 데이터를 로드합니다."""
+    # CDP 로딩
+    try:
+        import cdp
+        cdp_df = cdp._fetch_cdp_dataframe()
+        if cdp_df is not None and not cdp_df.empty:
+            normalized = {c.strip(): c for c in cdp_df.columns}
+            name_col = normalized.get("이름") or normalized.get("name") or list(cdp_df.columns)[0]
+            user_cdp = cdp_df[cdp_df[name_col] == user_name]
+            prefetch_cache['cdp'] = user_cdp.to_dict('records') if not user_cdp.empty else []
+        else:
+            prefetch_cache['cdp'] = []
+    except Exception:
+        prefetch_cache['cdp'] = []
+    
+    # IDP 로딩
+    try:
+        import idp_usage
+        idp_df = idp_usage.fetch_idp_dataframe()
+        if idp_df is not None and not idp_df.empty:
+            if '이름' in idp_df.columns:
+                user_idp = idp_df[idp_df['이름'] == user_name]
+                prefetch_cache['idp'] = user_idp.to_dict('records') if not user_idp.empty else []
+            else:
+                prefetch_cache['idp'] = idp_df.to_dict('records')
+        else:
+            prefetch_cache['idp'] = []
+    except Exception:
+        prefetch_cache['idp'] = []
+    
+    # Mission & KPI 로딩
+    try:
+        import organization
+        mk_cache = st.session_state.get('_mission_kpi_cache') or {}
+        mk_ttl = 300
+        mission_kpi_df = None
+        if mk_cache and isinstance(mk_cache, dict):
+            ts = mk_cache.get('ts')
+            df_cached = mk_cache.get('df')
+            if ts and (time.time() - float(ts) < mk_ttl) and df_cached is not None:
+                mission_kpi_df = pd.DataFrame(df_cached)
+        if mission_kpi_df is None:
+            mission_kpi_df = organization.get_sheet_data(organization.MISSION_KPI_SHEET_ID)
+            if mission_kpi_df is not None and not mission_kpi_df.empty:
+                st.session_state['_mission_kpi_cache'] = {'ts': time.time(), 'df': mission_kpi_df.to_dict('records')}
+        if mission_kpi_df is not None and not mission_kpi_df.empty:
+            prefetch_cache['mission_kpi'] = mission_kpi_df.to_dict('records')
+        else:
+            prefetch_cache['mission_kpi'] = []
+    except Exception:
+        prefetch_cache['mission_kpi'] = []
+    
+    # Team Ground Rule 로딩
+    try:
+        import organization
+        gr_cache = st.session_state.get('_ground_rule_cache') or {}
+        gr_ttl = 300
+        ground_rule_df = None
+        if gr_cache and isinstance(gr_cache, dict):
+            ts = gr_cache.get('ts')
+            df_cached = gr_cache.get('df')
+            if ts and (time.time() - float(ts) < gr_ttl) and df_cached is not None:
+                ground_rule_df = pd.DataFrame(df_cached)
+        if ground_rule_df is None:
+            ground_rule_df = organization.get_sheet_data(organization.GROUND_RULE_SHEET_ID)
+            if ground_rule_df is not None and not ground_rule_df.empty:
+                st.session_state['_ground_rule_cache'] = {'ts': time.time(), 'df': ground_rule_df.to_dict('records')}
+        if ground_rule_df is not None and not ground_rule_df.empty:
+            prefetch_cache['ground_rule'] = ground_rule_df.to_dict('records')
+        else:
+            prefetch_cache['ground_rule'] = []
+    except Exception:
+        prefetch_cache['ground_rule'] = []
+
 def ensure_cache_data():
     """필요한 캐시 데이터가 있는지 확인하고, 없으면 로드합니다."""
+    # 빈번한 호출 가드: 최소 30초 간격
+    last_ts = st.session_state.get('_ensure_cache_last_ts')
+    now_ts = time.time()
+    if last_ts and (now_ts - float(last_ts) < 30):
+        return True
+    st.session_state['_ensure_cache_last_ts'] = now_ts
+
     # 현재 조회 중인 사용자 정보 가져오기 (관리자가 다른 사용자를 선택한 경우)
     viewing_user = get_current_viewing_user()
     if not viewing_user:
@@ -1691,21 +1885,8 @@ def ensure_cache_data():
     if not current_user_name:
         return False
     
-    # 관리자인 경우 사용자별 캐시에서 가져오기
-    user_info = st.session_state.get('user_info')
-    is_admin = user_info and user_info.get('role', '').strip() == 'admin'
-    
-    if is_admin and 'prefetch_cache_by_user' in st.session_state:
-        prefetch_cache_by_user = st.session_state.prefetch_cache_by_user
-        if current_user_name in prefetch_cache_by_user:
-            # 해당 사용자의 캐시를 prefetch_cache로 설정
-            st.session_state.prefetch_cache = prefetch_cache_by_user[current_user_name].copy()
-            prefetch_cache = st.session_state.prefetch_cache
-            # 이미 캐시가 있으므로 바로 반환
-            return True
-    
-    # 일반 사용자이거나 캐시가 없는 경우
-    # prefetch_cache 초기화
+    # 관리자든 일반 사용자든 항상 새로 데이터를 로딩합니다 (미리 캐시된 데이터 재사용 안 함)
+    # prefetch_cache 초기화 (항상 새로 로딩하도록)
     if 'prefetch_cache' not in st.session_state:
         st.session_state.prefetch_cache = {}
     
@@ -1717,8 +1898,8 @@ def ensure_cache_data():
     # 캐시에 저장된 사용자 이름 확인 (다른 사용자의 데이터인지 체크)
     cached_user_name = prefetch_cache.get('_cached_user_name')
     
-    # 사용자가 변경되었으면 캐시 완전히 초기화
-    if cached_user_name and cached_user_name != current_user_name:
+    # 사용자가 변경되었거나, 항상 새로 로딩하기 위해 캐시 완전히 초기화
+    if cached_user_name != current_user_name:
         st.session_state.prefetch_cache = {}
         prefetch_cache = {}
     
@@ -1728,277 +1909,24 @@ def ensure_cache_data():
     
     user_name = current_user_name
     
-    missing_data = []
-    need_load = False
-    
-    # 캐시 확인
-    if not prefetch_cache.get('archive'):
-        missing_data.append('Snippet 아카이브')
-        need_load = True
-    if not prefetch_cache.get('cdp'):
-        missing_data.append('CDP')
-        need_load = True
-    if not prefetch_cache.get('idp'):
-        missing_data.append('IDP')
-        need_load = True
-    if not prefetch_cache.get('mission_kpi'):
-        missing_data.append('Mission & KPI')
-        need_load = True
-    if not prefetch_cache.get('ground_rule'):
-        missing_data.append('Team Ground Rule')
-        need_load = True
-    
-    if not need_load:
-        return True
+    # 항상 새로 로딩 (캐시된 데이터 재사용 안 함)
+    # 1on1 코칭 버튼을 눌렀을 때마다 최신 데이터를 로딩하기 위해
+    # 기존 캐시가 있어도 무시하고 새로 로딩합니다
     
     # 데이터 로딩
     status_text = st.empty()
     progress_bar = st.progress(0)
     
     # 1. Snippet 아카이브 로딩
-    if not prefetch_cache.get('archive'):
-        status_text.info("📚 Snippet 아카이브 데이터 로딩 중...")
-        progress_bar.progress(10)
-        try:
-            import sys
-            import Archive
-            
-            # main.py 모듈 가져오기 (여러 방법 시도)
-            main_module = None
-            get_client = None
-            spreadsheet_id = None
-            
-            # 방법 1: sys.modules에서 찾기
-            main_module = sys.modules.get('main')
-            
-            # 방법 2: 직접 import 시도
-            if not main_module:
-                try:
-                    import main as main_mod
-                    main_module = main_mod
-                except Exception:
-                    pass
-            
-            # 방법 3: importlib로 로드 시도
-            if not main_module:
-                try:
-                    import importlib
-                    main_module = importlib.import_module('main')
-                except Exception:
-                    pass
-            
-            # main.py의 함수들을 직접 사용하여 로드
-            main_get_client = None
-            main_spreadsheet_id = None
-            
-            if main_module:
-                main_get_client = getattr(main_module, 'get_google_sheets_client', None)
-                main_spreadsheet_id = getattr(main_module, 'SPREADSHEET_ID', None)
-            
-            # 데이터 로드 시도
-            archive_df = None
-            
-            # 디버깅 정보 수집
-            debug_info = []
-            debug_info.append(f"사용자 이름: {user_name}")
-            debug_info.append(f"Google Sheets 연결: {st.session_state.get('google_sheets_connected', False)}")
-            debug_info.append(f"main_module 찾기: {main_module is not None}")
-            debug_info.append(f"main.py에서 get_client 찾기: {main_get_client is not None}")
-            debug_info.append(f"main.py에서 SPREADSHEET_ID 찾기: {main_spreadsheet_id}")
-            
-            # 최종 값 결정 (우선순위: main.py > 1on1.py > 하드코딩)
-            if main_get_client:
-                get_client = main_get_client
-                debug_info.append("✅ main.py의 get_google_sheets_client 사용")
-            else:
-                get_client = get_google_sheets_client
-                debug_info.append("✅ 1on1.py의 get_google_sheets_client 사용")
-            
-            if main_spreadsheet_id:
-                spreadsheet_id = main_spreadsheet_id
-                debug_info.append(f"✅ main.py의 SPREADSHEET_ID 사용: {spreadsheet_id}")
-            else:
-                spreadsheet_id = "1THmwStR6p0_SUyLEV6-edT0kigANvTCPOkAzN7NaEQE"
-                debug_info.append(f"✅ 하드코딩된 spreadsheet_id 사용: {spreadsheet_id}")
-            
-            debug_info.append(f"최종 get_client: {get_client is not None} (타입: {type(get_client).__name__})")
-            debug_info.append(f"최종 spreadsheet_id: {spreadsheet_id}")
-            
-            # 1순위: Google Sheets에서 로드
-            if get_client and spreadsheet_id:
-                # google_sheets_connected 상태와 무관하게 시도 (연결 상태가 잘못 표시될 수 있음)
-                try:
-                    debug_info.append(f"Google Sheets에서 로드 시도 중... (spreadsheet_id: {spreadsheet_id})")
-                    # get_client가 함수인지 확인
-                    if callable(get_client):
-                        debug_info.append("get_client는 호출 가능한 함수입니다")
-                        archive_df = Archive.get_snippets_from_google_sheets(get_client, spreadsheet_id)
-                    else:
-                        debug_info.append(f"get_client가 함수가 아닙니다: {type(get_client)}")
-                        # 직접 시도
-                        client = None
-                        if main_module and hasattr(main_module, 'get_google_sheets_client'):
-                            client = main_module.get_google_sheets_client()
-                            if client:
-                                spreadsheet = client.open_by_key(spreadsheet_id)
-                                worksheet = spreadsheet.worksheet("Sheet1")
-                                records = worksheet.get_all_records()
-                                archive_df = pd.DataFrame(records)
-                            else:
-                                archive_df = None
-                        else:
-                            archive_df = None
-                    
-                    if archive_df is not None and not archive_df.empty:
-                        debug_info.append(f"Google Sheets 로드 성공: {len(archive_df)}개 행, {len(archive_df.columns)}개 컬럼")
-                    else:
-                        debug_info.append("Google Sheets 데이터가 비어있거나 None")
-                except Exception as gs_error:
-                    import traceback
-                    error_trace = traceback.format_exc()
-                    debug_info.append(f"Google Sheets 로딩 실패: {str(gs_error)}")
-                    debug_info.append(f"상세 오류: {error_trace[:500]}")  # 처음 500자만
-                    archive_df = None
-            else:
-                debug_info.append(f"조건 불만족 - get_client: {get_client is not None}, spreadsheet_id: {spreadsheet_id}")
-                if not get_client:
-                    debug_info.append("get_client 함수를 찾을 수 없습니다")
-                if not spreadsheet_id:
-                    debug_info.append("spreadsheet_id를 찾을 수 없습니다")
-            
-            # 2순위: 로컬 CSV에서 로드
-            if archive_df is None or (hasattr(archive_df, 'empty') and archive_df.empty):
-                try:
-                    debug_info.append("로컬 CSV에서 로드 시도 중...")
-                    archive_df = Archive.get_snippets_from_local_csv()
-                    if archive_df is not None and not archive_df.empty:
-                        debug_info.append(f"로컬 CSV 로드 성공: {len(archive_df)}개 행")
-                    else:
-                        debug_info.append("로컬 CSV 데이터가 비어있거나 파일 없음")
-                except Exception as csv_error:
-                    debug_info.append(f"로컬 CSV 로딩 실패: {str(csv_error)}")
-                    archive_df = None
-            
-            # 데이터 처리
-            if archive_df is not None and not archive_df.empty:
-                debug_info.append(f"데이터프레임 컬럼: {list(archive_df.columns)}")
-                
-                # 컬럼명 확인 (대소문자 무시, 공백 제거)
-                name_column = None
-                for col in archive_df.columns:
-                    col_clean = str(col).strip().lower()
-                    if '이름' in str(col) or 'name' in col_clean:
-                        name_column = col
-                        debug_info.append(f"이름 컬럼 찾음: {col}")
-                        break
-                
-                if name_column:
-                    # 사용자 이름으로 필터링
-                    user_archive = archive_df[archive_df[name_column] == user_name]
-                    debug_info.append(f"사용자 '{user_name}' 매칭 결과: {len(user_archive)}개 행")
-                    
-                    # 정확히 매칭되지 않으면 부분 매칭 시도
-                    if user_archive.empty:
-                        # 부분 매칭 시도 (공백 제거)
-                        user_name_clean = str(user_name).strip()
-                        for idx, row in archive_df.iterrows():
-                            row_name = str(row[name_column]).strip() if pd.notna(row[name_column]) else ""
-                            if user_name_clean == row_name:
-                                user_archive = archive_df[archive_df.index == idx]
-                                debug_info.append(f"부분 매칭 성공: 인덱스 {idx}")
-                                break
-                    
-                    prefetch_cache['archive'] = user_archive.to_dict('records') if not user_archive.empty else []
-                else:
-                    debug_info.append("이름 컬럼을 찾을 수 없음 - 전체 데이터 사용")
-                    # 이름 컬럼이 없으면 전체 데이터 사용
-                    prefetch_cache['archive'] = archive_df.to_dict('records')
-            else:
-                debug_info.append("데이터프레임이 비어있거나 None")
-                prefetch_cache['archive'] = []
-           
-            
-            # 로딩 실패 시 경고 표시
-            if not prefetch_cache.get('archive'):
-                if debug_info:
-                    # 마지막 몇 개 디버그 메시지만 표시
-                    recent_errors = [d for d in debug_info if any(keyword in d for keyword in ['실패', '없음', '비어', 'None', '불만족', '찾을 수 없'])]
-                    if recent_errors:
-                        error_msg = " | ".join(recent_errors[-3:])
-                        st.error(f"❌ Snippet 아카이브 데이터를 찾을 수 없습니다.\n\n**오류 정보:**\n{error_msg}\n\n**해결 방법:**\n- 위의 '🔍 Snippet 아카이브 로딩 상세 정보'를 펼쳐서 자세한 정보를 확인하세요.\n- Google Sheets 연결 상태를 확인하세요.\n- 사용자 이름이 데이터의 '이름' 컬럼과 정확히 일치하는지 확인하세요.")
-                
-        except Exception as e:
-            # 에러 상세 정보를 로그로 남기기
-            import traceback
-            error_detail = traceback.format_exc()
-            st.warning(f"⚠️ Snippet 아카이브 로딩 중 오류: {str(e)}")
-            # 디버그 정보는 개발 환경에서만 표시
-            if st.session_state.get('debug_mode', False):
-                st.text(f"상세 오류:\n{error_detail}")
-            prefetch_cache['archive'] = []
+    status_text.info("📚 Snippet 아카이브 데이터 로딩 중...")
+    progress_bar.progress(10)
+    _load_archive_data(user_name, prefetch_cache)
     
-    # 2. CDP 로딩
-    if not prefetch_cache.get('cdp'):
-        status_text.info("📊 CDP 데이터 로딩 중...")
-        progress_bar.progress(30)
-        try:
-            import cdp
-            cdp_df = cdp._fetch_cdp_dataframe()
-            if cdp_df is not None and not cdp_df.empty:
-                normalized = {c.strip(): c for c in cdp_df.columns}
-                name_col = normalized.get("이름") or normalized.get("name") or list(cdp_df.columns)[0]
-                user_cdp = cdp_df[cdp_df[name_col] == user_name]
-                prefetch_cache['cdp'] = user_cdp.to_dict('records') if not user_cdp.empty else []
-            else:
-                prefetch_cache['cdp'] = []
-        except Exception:
-            prefetch_cache['cdp'] = []
-    
-    # 3. IDP 로딩
-    if not prefetch_cache.get('idp'):
-        status_text.info("🎯 IDP 데이터 로딩 중...")
-        progress_bar.progress(50)
-        try:
-            import idp_usage
-            idp_df = idp_usage.fetch_idp_dataframe()
-            if idp_df is not None and not idp_df.empty:
-                if '이름' in idp_df.columns:
-                    user_idp = idp_df[idp_df['이름'] == user_name]
-                    prefetch_cache['idp'] = user_idp.to_dict('records') if not user_idp.empty else []
-                else:
-                    prefetch_cache['idp'] = idp_df.to_dict('records')
-            else:
-                prefetch_cache['idp'] = []
-        except Exception:
-            prefetch_cache['idp'] = []
-    
-    # 4. Mission & KPI 로딩
-    if not prefetch_cache.get('mission_kpi'):
-        status_text.info("🎯 Mission & KPI 데이터 로딩 중...")
-        progress_bar.progress(70)
-        try:
-            import organization
-            mission_kpi_df = organization.get_sheet_data(organization.MISSION_KPI_SHEET_ID)
-            if mission_kpi_df is not None and not mission_kpi_df.empty:
-                prefetch_cache['mission_kpi'] = mission_kpi_df.to_dict('records')
-            else:
-                prefetch_cache['mission_kpi'] = []
-        except Exception:
-            prefetch_cache['mission_kpi'] = []
-    
-    # 5. Team Ground Rule 로딩
-    if not prefetch_cache.get('ground_rule'):
-        status_text.info("📋 Team Ground Rule 데이터 로딩 중...")
-        progress_bar.progress(90)
-        try:
-            import organization
-            ground_rule_df = organization.get_sheet_data(organization.GROUND_RULE_SHEET_ID)
-            if ground_rule_df is not None and not ground_rule_df.empty:
-                prefetch_cache['ground_rule'] = ground_rule_df.to_dict('records')
-            else:
-                prefetch_cache['ground_rule'] = []
-        except Exception:
-            prefetch_cache['ground_rule'] = []
+    # 2. CDP, IDP, Mission & KPI, Ground Rule 로딩
+    status_text.info("📊 기타 데이터 로딩 중...")
+    progress_bar.progress(30)
+    _load_other_data(user_name, prefetch_cache)
+    progress_bar.progress(90)
     
     # 캐시 저장
     st.session_state.prefetch_cache = prefetch_cache
@@ -2015,6 +1943,9 @@ def render_oneon1_embedded():
     # 현재 조회 중인 사용자 정보 가져오기
     viewing_user = get_current_viewing_user()
     user_name = viewing_user.get('name', '') if viewing_user else ''
+
+    # 관리자인 경우에도 우측 화면에서는 사용자 선택을 제공하지 않습니다.
+    # 사이드바에서 선택된 사용자를 st.session_state.viewing_user_info로 전달받아 사용합니다.
     
     st.subheader(f"{user_name}의 1on1 코칭 피드백")
     st.markdown("---")
