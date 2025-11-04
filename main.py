@@ -33,7 +33,7 @@ st.markdown(
     
     /* 사이드바 제목 폰트 사이즈 줄이기 (줄바꿈 방지) */
     [data-testid="stSidebar"] h1 {
-        font-size: 1.5rem !important;
+        font-size: 1.2rem !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
