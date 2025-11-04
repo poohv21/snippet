@@ -32,7 +32,10 @@ st.markdown(
     }
     
     /* 사이드바 제목 폰트 사이즈 줄이기 (줄바꿈 방지) */
-    [data-testid="stSidebar"] h1 {
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] .element-container h1,
+    [data-testid="stSidebar"] [class*="stTitle"] h1,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
         font-size: 1.2rem !important;
         white-space: nowrap !important;
         overflow: hidden !important;
@@ -1990,6 +1993,25 @@ def main():
     if not st.session_state.logged_in:
         render_login()
     else:
+        # 사이드바 스타일 재적용 (리프레시 시에도 유지되도록)
+        st.markdown(
+            """
+            <style>
+            /* 사이드바 제목 폰트 사이즈 강제 적용 (리프레시 대응) */
+            [data-testid="stSidebar"] h1,
+            [data-testid="stSidebar"] .element-container h1,
+            [data-testid="stSidebar"] [class*="stTitle"] h1,
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
+                font-size: 1.2rem !important;
+                white-space: nowrap !important;
+                overflow: hidden !important;
+                text-overflow: ellipsis !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        
         # 사이드바 렌더링
         render_sidebar()
         
