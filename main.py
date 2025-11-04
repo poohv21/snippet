@@ -2001,19 +2001,113 @@ def main():
             [data-testid="stSidebar"] h1,
             [data-testid="stSidebar"] .element-container h1,
             [data-testid="stSidebar"] [class*="stTitle"] h1,
-            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+            [data-testid="stSidebar"] h1[class],
+            [data-testid="stSidebar"] * h1 {
                 font-size: 1.2rem !important;
                 white-space: nowrap !important;
                 overflow: hidden !important;
                 text-overflow: ellipsis !important;
             }
             </style>
+            <script>
+            // 사이드바 제목 폰트 사이즈 강제 적용 (DOM 변경 시에도 유지)
+            (function() {
+                function applySidebarTitleStyle() {
+                    // Streamlit은 iframe 내에서 실행되므로 두 가지 방법 모두 시도
+                    const contexts = [
+                        window.parent.document,
+                        document
+                    ];
+                    
+                    contexts.forEach(function(doc) {
+                        try {
+                            const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+                            if (sidebar) {
+                                const h1Elements = sidebar.querySelectorAll('h1');
+                                h1Elements.forEach(function(h1) {
+                                    h1.style.setProperty('font-size', '1.2rem', 'important');
+                                    h1.style.setProperty('white-space', 'nowrap', 'important');
+                                    h1.style.setProperty('overflow', 'hidden', 'important');
+                                    h1.style.setProperty('text-overflow', 'ellipsis', 'important');
+                                });
+                            }
+                        } catch(e) {
+                            // iframe 접근 오류 무시
+                        }
+                    });
+                }
+                
+                // 즉시 적용
+                applySidebarTitleStyle();
+                
+                // DOM 변경 감지하여 자동 적용
+                function setupObserver() {
+                    const contexts = [
+                        { doc: window.parent.document, win: window.parent },
+                        { doc: document, win: window }
+                    ];
+                    
+                    contexts.forEach(function(ctx) {
+                        try {
+                            const sidebar = ctx.doc.querySelector('[data-testid="stSidebar"]');
+                            if (sidebar) {
+                                const observer = new ctx.win.MutationObserver(function(mutations) {
+                                    applySidebarTitleStyle();
+                                });
+                                observer.observe(sidebar, { childList: true, subtree: true, attributes: true });
+                            }
+                        } catch(e) {
+                            // iframe 접근 오류 무시
+                        }
+                    });
+                }
+                
+                // 사이드바가 로드되면 감시 시작
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', setupObserver);
+                    if (window.parent && window.parent.document.readyState === 'loading') {
+                        window.parent.document.addEventListener('DOMContentLoaded', setupObserver);
+                    }
+                } else {
+                    setupObserver();
+                }
+                
+                // 주기적으로도 체크 (추가 안전장치) - 버튼 클릭 시 즉시 반영
+                setInterval(applySidebarTitleStyle, 50);
+            })();
+            </script>
             """,
             unsafe_allow_html=True
         )
         
         # 사이드바 렌더링
         render_sidebar()
+        
+        # 사이드바 렌더링 후 스타일 재적용 (버튼 클릭 시에도 유지)
+        st.markdown(
+            """
+            <script>
+            // 사이드바 렌더링 후 즉시 스타일 적용
+            (function() {
+                setTimeout(function() {
+                    const sidebar = window.parent.document.querySelector('[data-testid="stSidebar"]') || 
+                                   document.querySelector('[data-testid="stSidebar"]');
+                    if (sidebar) {
+                        const h1Elements = sidebar.querySelectorAll('h1');
+                        h1Elements.forEach(function(h1) {
+                            h1.style.setProperty('font-size', '1.2rem', 'important');
+                            h1.style.setProperty('white-space', 'nowrap', 'important');
+                            h1.style.setProperty('overflow', 'hidden', 'important');
+                            h1.style.setProperty('text-overflow', 'ellipsis', 'important');
+                        });
+                    }
+                }, 0);
+            })();
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
         
         # 페이지 이동 경고 표시 (메인 콘텐츠 영역)
         render_navigation_warning()
