@@ -2011,7 +2011,7 @@ def main():
             }
             </style>
             <script>
-            // 사이드바 제목 폰트 사이즈 강제 적용 (DOM 변경 시에도 유지)
+            // 사이드바 제목 폰트 사이즈 초기 적용
             (function() {
                 function applySidebarTitleStyle() {
                     // Streamlit은 iframe 내에서 실행되므로 두 가지 방법 모두 시도
@@ -2038,43 +2038,8 @@ def main():
                     });
                 }
                 
-                // 즉시 적용
+                // 초기 로드 시에만 적용
                 applySidebarTitleStyle();
-                
-                // DOM 변경 감지하여 자동 적용
-                function setupObserver() {
-                    const contexts = [
-                        { doc: window.parent.document, win: window.parent },
-                        { doc: document, win: window }
-                    ];
-                    
-                    contexts.forEach(function(ctx) {
-                        try {
-                            const sidebar = ctx.doc.querySelector('[data-testid="stSidebar"]');
-                            if (sidebar) {
-                                const observer = new ctx.win.MutationObserver(function(mutations) {
-                                    applySidebarTitleStyle();
-                                });
-                                observer.observe(sidebar, { childList: true, subtree: true, attributes: true });
-                            }
-                        } catch(e) {
-                            // iframe 접근 오류 무시
-                        }
-                    });
-                }
-                
-                // 사이드바가 로드되면 감시 시작
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', setupObserver);
-                    if (window.parent && window.parent.document.readyState === 'loading') {
-                        window.parent.document.addEventListener('DOMContentLoaded', setupObserver);
-                    }
-                } else {
-                    setupObserver();
-                }
-                
-                // 주기적으로도 체크 (추가 안전장치) - 버튼 클릭 시 즉시 반영
-                setInterval(applySidebarTitleStyle, 50);
             })();
             </script>
             """,
@@ -2088,21 +2053,100 @@ def main():
         st.markdown(
             """
             <script>
-            // 사이드바 렌더링 후 즉시 스타일 적용
+            // 사이드바 제목 폰트 사이즈 적용 (사용자 선택/변경 및 메뉴 버튼 클릭 시에만)
             (function() {
-                setTimeout(function() {
-                    const sidebar = window.parent.document.querySelector('[data-testid="stSidebar"]') || 
-                                   document.querySelector('[data-testid="stSidebar"]');
-                    if (sidebar) {
-                        const h1Elements = sidebar.querySelectorAll('h1');
-                        h1Elements.forEach(function(h1) {
-                            h1.style.setProperty('font-size', '1.2rem', 'important');
-                            h1.style.setProperty('white-space', 'nowrap', 'important');
-                            h1.style.setProperty('overflow', 'hidden', 'important');
-                            h1.style.setProperty('text-overflow', 'ellipsis', 'important');
-                        });
-                    }
-                }, 0);
+                function applyTitleStyle() {
+                    const contexts = [
+                        window.parent.document,
+                        document
+                    ];
+                    
+                    contexts.forEach(function(doc) {
+                        try {
+                            const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+                            if (sidebar) {
+                                const h1Elements = sidebar.querySelectorAll('h1');
+                                h1Elements.forEach(function(h1) {
+                                    h1.style.setProperty('font-size', '1.2rem', 'important');
+                                    h1.style.setProperty('white-space', 'nowrap', 'important');
+                                    h1.style.setProperty('overflow', 'hidden', 'important');
+                                    h1.style.setProperty('text-overflow', 'ellipsis', 'important');
+                                });
+                            }
+                        } catch(e) {}
+                    });
+                }
+                
+                // 모든 버튼과 selectbox에 클릭/변경 이벤트 리스너 추가
+                function attachEventListeners() {
+                    const contexts = [
+                        window.parent.document,
+                        document
+                    ];
+                    
+                    contexts.forEach(function(doc) {
+                        try {
+                            const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+                            if (sidebar) {
+                                // 모든 버튼에 클릭 이벤트 리스너 (사이드바 메뉴 버튼)
+                                const buttons = sidebar.querySelectorAll('button');
+                                buttons.forEach(function(btn) {
+                                    // 이미 리스너가 추가된 버튼은 제외 (중복 방지)
+                                    if (!btn.hasAttribute('data-title-style-listener')) {
+                                        btn.setAttribute('data-title-style-listener', 'true');
+                                        btn.addEventListener('click', function() {
+                                            setTimeout(applyTitleStyle, 10);
+                                            setTimeout(applyTitleStyle, 50);
+                                            setTimeout(applyTitleStyle, 100);
+                                        }, true);
+                                    }
+                                });
+                                
+                                // 모든 selectbox에 변경 이벤트 리스너 (사용자 선택)
+                                const selectboxes = sidebar.querySelectorAll('select, [role="combobox"]');
+                                selectboxes.forEach(function(select) {
+                                    // 이미 리스너가 추가된 selectbox는 제외 (중복 방지)
+                                    if (!select.hasAttribute('data-title-style-listener')) {
+                                        select.setAttribute('data-title-style-listener', 'true');
+                                        select.addEventListener('change', function() {
+                                            setTimeout(applyTitleStyle, 10);
+                                            setTimeout(applyTitleStyle, 50);
+                                            setTimeout(applyTitleStyle, 100);
+                                        }, true);
+                                    }
+                                });
+                            }
+                        } catch(e) {}
+                    });
+                }
+                
+                // DOM 로드 후 이벤트 리스너 추가
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', function() {
+                        attachEventListeners();
+                    });
+                } else {
+                    attachEventListeners();
+                }
+                
+                // MutationObserver로 새로 추가된 버튼/selectbox에도 자동으로 리스너 추가
+                const contexts = [
+                    { doc: window.parent.document, win: window.parent },
+                    { doc: document, win: window }
+                ];
+                
+                contexts.forEach(function(ctx) {
+                    try {
+                        const sidebar = ctx.doc.querySelector('[data-testid="stSidebar"]');
+                        if (sidebar) {
+                            const observer = new ctx.win.MutationObserver(function(mutations) {
+                                // 새로 추가된 버튼/selectbox에 리스너 추가
+                                attachEventListeners();
+                            });
+                            observer.observe(sidebar, { childList: true, subtree: true });
+                        }
+                    } catch(e) {}
+                    });
             })();
             </script>
             """,
