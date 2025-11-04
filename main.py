@@ -1174,7 +1174,76 @@ def render_login():
 def render_sidebar():
     """사이드바 렌더링"""
     with st.sidebar:
+        # 사이드바 제목 스타일 강제 적용 (CSS 직접 삽입)
+        st.markdown(
+            """
+            <style>
+            /* 사이드바 제목 폰트 사이즈 강제 적용 - 최우선순위 */
+            [data-testid="stSidebar"] h1,
+            [data-testid="stSidebar"] .element-container h1,
+            [data-testid="stSidebar"] [class*="stTitle"] h1,
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+            [data-testid="stSidebar"] h1[class],
+            [data-testid="stSidebar"] * h1 {
+                font-size: 1.2rem !important;
+                white-space: nowrap !important;
+                overflow: hidden !important;
+                text-overflow: ellipsis !important;
+            }
+            </style>
+            <script>
+            (function() {
+                function forceTitleStyle() {
+                    const contexts = [window.parent.document, document];
+                    contexts.forEach(function(doc) {
+                        try {
+                            const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+                            if (sidebar) {
+                                const h1Elements = sidebar.querySelectorAll('h1');
+                                h1Elements.forEach(function(h1) {
+                                    h1.style.cssText = 'font-size: 1.2rem !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;';
+                                });
+                            }
+                        } catch(e) {}
+                    });
+                }
+                forceTitleStyle();
+                setTimeout(forceTitleStyle, 0);
+                setTimeout(forceTitleStyle, 10);
+            })();
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
+        
         st.title("📝 Daily Snippets")
+        
+        # 제목 렌더링 직후 스타일 재적용
+        st.markdown(
+            """
+            <script>
+            (function() {
+                function forceTitleStyle() {
+                    const contexts = [window.parent.document, document];
+                    contexts.forEach(function(doc) {
+                        try {
+                            const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+                            if (sidebar) {
+                                const h1Elements = sidebar.querySelectorAll('h1');
+                                h1Elements.forEach(function(h1) {
+                                    h1.style.cssText = 'font-size: 1.2rem !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;';
+                                });
+                            }
+                        } catch(e) {}
+                    });
+                }
+                setTimeout(forceTitleStyle, 0);
+                setTimeout(forceTitleStyle, 50);
+            })();
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
 
         
         # 로그인된 사용자 정보
@@ -2094,9 +2163,13 @@ def main():
                                     // 이미 리스너가 추가된 버튼은 제외 (중복 방지)
                                     if (!btn.hasAttribute('data-title-style-listener')) {
                                         btn.setAttribute('data-title-style-listener', 'true');
-                                        btn.addEventListener('click', function() {
+                                        btn.addEventListener('click', function(e) {
                                             // 즉시 적용
                                             applyTitleStyle();
+                                            // 버블링 단계에서도 적용
+                                            setTimeout(function() {
+                                                applyTitleStyle();
+                                            }, 0);
                                             // Streamlit rerun 후에도 스타일 유지
                                             setTimeout(applyTitleStyle, 10);
                                             setTimeout(applyTitleStyle, 50);
@@ -2104,11 +2177,14 @@ def main():
                                             setTimeout(applyTitleStyle, 200);
                                             setTimeout(applyTitleStyle, 300);
                                             setTimeout(applyTitleStyle, 500);
+                                            setTimeout(applyTitleStyle, 800);
+                                            setTimeout(applyTitleStyle, 1000);
                                             // requestAnimationFrame을 사용하여 렌더링 사이클에 맞춰 적용
                                             requestAnimationFrame(function() {
                                                 applyTitleStyle();
                                                 setTimeout(applyTitleStyle, 50);
                                                 setTimeout(applyTitleStyle, 150);
+                                                setTimeout(applyTitleStyle, 300);
                                             });
                                         }, true);
                                     }
@@ -2156,8 +2232,12 @@ def main():
                                 attachEventListeners();
                                 // DOM 변경 시 스타일도 재적용 (Streamlit rerun 대응)
                                 applyTitleStyle();
+                                // 여러 타이밍에 재적용
+                                setTimeout(applyTitleStyle, 0);
+                                setTimeout(applyTitleStyle, 10);
+                                setTimeout(applyTitleStyle, 50);
                             });
-                            observer.observe(sidebar, { childList: true, subtree: true, attributes: true });
+                            observer.observe(sidebar, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
                         }
                     } catch(e) {}
                     });
