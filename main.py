@@ -31,15 +31,27 @@ st.markdown(
         width: 250px !important;
     }
     
-    /* 사이드바 제목 폰트 사이즈 줄이기 (줄바꿈 방지) */
+    /* 사이드바 제목 폰트 사이즈 줄이기 (줄바꿈 방지) - 최고 우선순위 */
     [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h1[class],
+    [data-testid="stSidebar"] h1[class*="st"],
     [data-testid="stSidebar"] .element-container h1,
+    [data-testid="stSidebar"] .element-container h1[class],
     [data-testid="stSidebar"] [class*="stTitle"] h1,
-    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1 {
+    [data-testid="stSidebar"] [class*="stTitle"] h1[class],
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1[class],
+    [data-testid="stSidebar"] * h1,
+    [data-testid="stSidebar"] * h1[class],
+    [data-testid="stSidebar"] div h1,
+    [data-testid="stSidebar"] div h1[class],
+    [data-testid="stSidebar"] section h1,
+    [data-testid="stSidebar"] section h1[class] {
         font-size: 1.2rem !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
+        line-height: 1.2rem !important;
     }
     
     /* Streamlit 메인 뷰 컨테이너를 직접 타겟팅 */
@@ -2065,18 +2077,28 @@ def main():
         # 사이드바 스타일 재적용 (리프레시 시에도 유지되도록)
         st.markdown(
             """
-            <style>
-            /* 사이드바 제목 폰트 사이즈 강제 적용 (리프레시 대응) */
+            <style id="sidebar-title-style-reapply">
+            /* 사이드바 제목 폰트 사이즈 강제 적용 (리프레시 대응) - 최고 우선순위 */
             [data-testid="stSidebar"] h1,
-            [data-testid="stSidebar"] .element-container h1,
-            [data-testid="stSidebar"] [class*="stTitle"] h1,
-            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
             [data-testid="stSidebar"] h1[class],
-            [data-testid="stSidebar"] * h1 {
+            [data-testid="stSidebar"] h1[class*="st"],
+            [data-testid="stSidebar"] .element-container h1,
+            [data-testid="stSidebar"] .element-container h1[class],
+            [data-testid="stSidebar"] [class*="stTitle"] h1,
+            [data-testid="stSidebar"] [class*="stTitle"] h1[class],
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+            [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1[class],
+            [data-testid="stSidebar"] * h1,
+            [data-testid="stSidebar"] * h1[class],
+            [data-testid="stSidebar"] div h1,
+            [data-testid="stSidebar"] div h1[class],
+            [data-testid="stSidebar"] section h1,
+            [data-testid="stSidebar"] section h1[class] {
                 font-size: 1.2rem !important;
                 white-space: nowrap !important;
                 overflow: hidden !important;
                 text-overflow: ellipsis !important;
+                line-height: 1.2rem !important;
             }
             </style>
             <script>
