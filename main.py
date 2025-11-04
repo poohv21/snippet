@@ -2095,9 +2095,21 @@ def main():
                                     if (!btn.hasAttribute('data-title-style-listener')) {
                                         btn.setAttribute('data-title-style-listener', 'true');
                                         btn.addEventListener('click', function() {
+                                            // 즉시 적용
+                                            applyTitleStyle();
+                                            // Streamlit rerun 후에도 스타일 유지
                                             setTimeout(applyTitleStyle, 10);
                                             setTimeout(applyTitleStyle, 50);
                                             setTimeout(applyTitleStyle, 100);
+                                            setTimeout(applyTitleStyle, 200);
+                                            setTimeout(applyTitleStyle, 300);
+                                            setTimeout(applyTitleStyle, 500);
+                                            // requestAnimationFrame을 사용하여 렌더링 사이클에 맞춰 적용
+                                            requestAnimationFrame(function() {
+                                                applyTitleStyle();
+                                                setTimeout(applyTitleStyle, 50);
+                                                setTimeout(applyTitleStyle, 150);
+                                            });
                                         }, true);
                                     }
                                 });
@@ -2142,11 +2154,34 @@ def main():
                             const observer = new ctx.win.MutationObserver(function(mutations) {
                                 // 새로 추가된 버튼/selectbox에 리스너 추가
                                 attachEventListeners();
+                                // DOM 변경 시 스타일도 재적용 (Streamlit rerun 대응)
+                                applyTitleStyle();
                             });
-                            observer.observe(sidebar, { childList: true, subtree: true });
+                            observer.observe(sidebar, { childList: true, subtree: true, attributes: true });
                         }
                     } catch(e) {}
                     });
+                
+                // Streamlit의 rerun 완료 감지 (iframe 내부의 Streamlit 이벤트)
+                try {
+                    // Streamlit이 완전히 렌더링된 후 스타일 재적용
+                    window.addEventListener('load', function() {
+                        setTimeout(applyTitleStyle, 100);
+                        setTimeout(applyTitleStyle, 300);
+                        setTimeout(applyTitleStyle, 500);
+                    });
+                    
+                    // Streamlit의 메시지 이벤트 감지 (rerun 완료 시)
+                    if (window.parent && window.parent.postMessage) {
+                        window.addEventListener('message', function(event) {
+                            if (event.data && event.data.type === 'streamlit:render') {
+                                setTimeout(applyTitleStyle, 10);
+                                setTimeout(applyTitleStyle, 50);
+                                setTimeout(applyTitleStyle, 100);
+                            }
+                        });
+                    }
+                } catch(e) {}
             })();
             </script>
             """,
