@@ -2186,28 +2186,60 @@ def main():
                                     if (!btn.hasAttribute('data-title-style-listener')) {
                                         btn.setAttribute('data-title-style-listener', 'true');
                                         btn.addEventListener('click', function(e) {
+                                            // 버튼 텍스트 확인
+                                            const buttonText = btn.textContent || btn.innerText || '';
+                                            const isArchiveButton = buttonText.includes('Snippet 아카이브') || buttonText.includes('아카이브');
+                                            
                                             // 즉시 적용
                                             applyTitleStyle();
                                             // 버블링 단계에서도 적용
                                             setTimeout(function() {
                                                 applyTitleStyle();
                                             }, 0);
-                                            // Streamlit rerun 후에도 스타일 유지
-                                            setTimeout(applyTitleStyle, 10);
-                                            setTimeout(applyTitleStyle, 50);
-                                            setTimeout(applyTitleStyle, 100);
-                                            setTimeout(applyTitleStyle, 200);
-                                            setTimeout(applyTitleStyle, 300);
-                                            setTimeout(applyTitleStyle, 500);
-                                            setTimeout(applyTitleStyle, 800);
-                                            setTimeout(applyTitleStyle, 1000);
-                                            // requestAnimationFrame을 사용하여 렌더링 사이클에 맞춰 적용
-                                            requestAnimationFrame(function() {
-                                                applyTitleStyle();
+                                            
+                                            // Snippet 아카이브 버튼은 refresh_archive_cache()와 rerun이 발생하므로 더 긴 시간 동안 재적용
+                                            if (isArchiveButton) {
+                                                setTimeout(applyTitleStyle, 10);
                                                 setTimeout(applyTitleStyle, 50);
-                                                setTimeout(applyTitleStyle, 150);
+                                                setTimeout(applyTitleStyle, 100);
+                                                setTimeout(applyTitleStyle, 200);
                                                 setTimeout(applyTitleStyle, 300);
-                                            });
+                                                setTimeout(applyTitleStyle, 500);
+                                                setTimeout(applyTitleStyle, 800);
+                                                setTimeout(applyTitleStyle, 1000);
+                                                setTimeout(applyTitleStyle, 1500);
+                                                setTimeout(applyTitleStyle, 2000);
+                                                // requestAnimationFrame을 여러 번 사용
+                                                requestAnimationFrame(function() {
+                                                    applyTitleStyle();
+                                                    setTimeout(applyTitleStyle, 50);
+                                                    setTimeout(applyTitleStyle, 150);
+                                                    setTimeout(applyTitleStyle, 300);
+                                                    setTimeout(applyTitleStyle, 500);
+                                                });
+                                                requestAnimationFrame(function() {
+                                                    setTimeout(applyTitleStyle, 100);
+                                                    setTimeout(applyTitleStyle, 300);
+                                                    setTimeout(applyTitleStyle, 600);
+                                                });
+                                            } else {
+                                                // 일반 버튼
+                                                setTimeout(applyTitleStyle, 10);
+                                                setTimeout(applyTitleStyle, 50);
+                                                setTimeout(applyTitleStyle, 100);
+                                                setTimeout(applyTitleStyle, 200);
+                                                setTimeout(applyTitleStyle, 300);
+                                                setTimeout(applyTitleStyle, 500);
+                                                setTimeout(applyTitleStyle, 800);
+                                                setTimeout(applyTitleStyle, 1000);
+                                                // requestAnimationFrame을 사용하여 렌더링 사이클에 맞춰 적용
+                                                requestAnimationFrame(function() {
+                                                    applyTitleStyle();
+                                                    setTimeout(applyTitleStyle, 50);
+                                                    setTimeout(applyTitleStyle, 150);
+                                                    setTimeout(applyTitleStyle, 300);
+                                                });
+                                            }
                                         }, true);
                                     }
                                 });
@@ -2219,9 +2251,25 @@ def main():
                                     if (!select.hasAttribute('data-title-style-listener')) {
                                         select.setAttribute('data-title-style-listener', 'true');
                                         select.addEventListener('change', function() {
+                                            // 즉시 적용
+                                            applyTitleStyle();
+                                            // 사용자 선택은 rerun이 발생하므로 더 긴 시간 동안 재적용
                                             setTimeout(applyTitleStyle, 10);
                                             setTimeout(applyTitleStyle, 50);
                                             setTimeout(applyTitleStyle, 100);
+                                            setTimeout(applyTitleStyle, 200);
+                                            setTimeout(applyTitleStyle, 300);
+                                            setTimeout(applyTitleStyle, 500);
+                                            setTimeout(applyTitleStyle, 800);
+                                            setTimeout(applyTitleStyle, 1000);
+                                            setTimeout(applyTitleStyle, 1500);
+                                            // requestAnimationFrame 사용
+                                            requestAnimationFrame(function() {
+                                                applyTitleStyle();
+                                                setTimeout(applyTitleStyle, 50);
+                                                setTimeout(applyTitleStyle, 150);
+                                                setTimeout(applyTitleStyle, 300);
+                                            });
                                         }, true);
                                     }
                                 });
@@ -2250,14 +2298,42 @@ def main():
                         const sidebar = ctx.doc.querySelector('[data-testid="stSidebar"]');
                         if (sidebar) {
                             const observer = new ctx.win.MutationObserver(function(mutations) {
-                                // 새로 추가된 버튼/selectbox에 리스너 추가
-                                attachEventListeners();
-                                // DOM 변경 시 스타일도 재적용 (Streamlit rerun 대응)
-                                applyTitleStyle();
-                                // 여러 타이밍에 재적용
-                                setTimeout(applyTitleStyle, 0);
-                                setTimeout(applyTitleStyle, 10);
-                                setTimeout(applyTitleStyle, 50);
+                                let shouldReapply = false;
+                                
+                                mutations.forEach(function(mutation) {
+                                    // h1 요소가 추가되거나 변경된 경우
+                                    if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                                        mutation.addedNodes.forEach(function(node) {
+                                            if (node.nodeType === 1) { // Element node
+                                                if (node.tagName === 'H1' || node.querySelectorAll && node.querySelectorAll('h1').length > 0) {
+                                                    shouldReapply = true;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    // style이나 class 속성이 변경된 경우
+                                    if (mutation.type === 'attributes' && (mutation.attributeName === 'style' || mutation.attributeName === 'class')) {
+                                        if (mutation.target.tagName === 'H1' || mutation.target.querySelectorAll && mutation.target.querySelectorAll('h1').length > 0) {
+                                            shouldReapply = true;
+                                        }
+                                    }
+                                });
+                                
+                                if (shouldReapply) {
+                                    // 새로 추가된 버튼/selectbox에 리스너 추가
+                                    attachEventListeners();
+                                    // DOM 변경 시 스타일도 재적용 (Streamlit rerun 대응)
+                                    applyTitleStyle();
+                                    // 여러 타이밍에 재적용
+                                    setTimeout(applyTitleStyle, 0);
+                                    setTimeout(applyTitleStyle, 10);
+                                    setTimeout(applyTitleStyle, 50);
+                                    setTimeout(applyTitleStyle, 100);
+                                    setTimeout(applyTitleStyle, 200);
+                                } else {
+                                    // 리스너만 추가 (성능 최적화)
+                                    attachEventListeners();
+                                }
                             });
                             observer.observe(sidebar, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
                         }
